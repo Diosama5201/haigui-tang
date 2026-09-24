@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Read",
+      "Edit",
+      "Bash(git:*)",
+      "Bash(npm:*)",
+      "Bash(node:*)"
+    ],
+    "deny": [
+      "Read(./.env)",
+      "Read(./deploy.local.bat)"
+    ]
+  }
+}

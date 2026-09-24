@@ -1,0 +1,15 @@
+version: "3.8"
+
+services:
+  haigui-tang:
+    build: .
+    container_name: haigui-tang
+    ports:
+      - "3000:3000"
+    environment:
+      - PORT=3000
+      # 生产环境务必替换为随机密钥（可用 openssl rand -hex 32 生成）
+      - JWT_SECRET=${JWT_SECRET:-please-change-me-in-production}
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped

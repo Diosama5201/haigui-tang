@@ -1,0 +1,19 @@
+# Render 部署蓝图（Blueprint）
+# 使用方式：Render Dashboard -> New -> Blueprint -> 选择本仓库
+services:
+  - type: web
+    name: haigui-tang
+    runtime: docker
+    plan: free
+    region: singapore
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /healthz
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: JWT_SECRET
+        generateValue: true
+      - key: PORT
+        value: "3000"
+    # 免费版文件系统为临时存储，重启/重新部署会清空数据。
+    # 正式使用请挂载持久化磁盘（paid）或将数据迁移到云数据库。

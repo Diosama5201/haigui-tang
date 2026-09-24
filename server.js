@@ -1,0 +1,1325 @@
+/**
+ * 海龟汤网站 — 后端服务
+ * 技术栈：Node.js 原生 http 模块 + MySQL（mysql2）
+ * 功能：用户注册/登录（JWT 鉴权）、海龟汤的增删查（全局共享）、txt 文件上传
+ * 数据：用户与海龟汤均存 MySQL；所有登录用户看到同一份全量海龟汤库，删除仅限创建者本人
+ */
+const http = require('http');
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+const mysql = require('mysql2/promise');
+const chroma = require('./vector-store'); // 内嵌 Chroma 风格向量库
+const { parseProgressFromText, estimateProgressLocally } = require('./progress-utils'); // 进度智能体纯函数工具
+const offlineEngine = require('./offline-engine'); // 内置离线推理引擎
+
+// 向量库 collection 名称（汤类知识库统一存这里）
+const VECTOR_COLLECTION = 'haigui_soups';
+
+// ==================== 加载 .env（若存在，不覆盖已有环境变量） ====================
+(function loadEnv() {
+  const envFile = path.join(__dirname, '.env');
+  if (!fs.existsSync(envFile)) return;
+  const lines = fs.readFileSync(envFile, 'utf8').split(/\r?\n/);
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const eq = trimmed.indexOf('=');
+    if (eq === -1) continue;
+    const key = trimmed.slice(0, eq).trim();
+    let val = trimmed.slice(eq + 1).trim();
+    // 去掉首尾引号
+    if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+      val = val.slice(1, -1);
+    }
+    if (key && process.env[key] === undefined) process.env[key] = val;
+  }
+})();
+
+// ==================== 基础配置（环境变量优先） ====================
+const PORT = process.env.PORT || 3000;
+const JWT_SECRET = process.env.JWT_SECRET || 'haigui-tang-secret-please-change-in-prod';
+const TOKEN_EXPIRE = 7 * 24 * 60 * 60 * 1000; // 7 天
+
+// MySQL 连接配置（通过环境变量注入，禁止硬编码）
+const DB_CONFIG = {
+  host: process.env.DB_HOST || '127.0.0.1',
+  port: Number(process.env.DB_PORT) || 3306,
+  user: process.env.DB_USER || 'root',
+  password: process.env.DB_PASSWORD || '',
+  database: process.env.DB_NAME || 'haiguitang',
+  charset: 'utf8mb4',
+  // 数字按 number 返回，避免 bigint 序列化问题
+  decimalNumbers: true,
+};
+
+// 上传文件仍存本地磁盘（txt 内容解析后入库，原始文件留档）
+const UPLOAD_DIR = path.join(__dirname, 'data', 'uploads');
+if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+
+// ==================== 密码加密（加盐 SHA256） ====================
+function hashPassword(password, salt) {
+  return crypto.createHash('sha256').update(salt + ':' + password).digest('hex');
+}
+function genSalt() {
+  return crypto.randomBytes(16).toString('hex');
+}
+
+// ==================== JWT（简化自实现，HS256） ====================
+function base64url(str) {
+  return Buffer.from(str).toString('base64url');
+}
+function base64urlDecode(str) {
+  return Buffer.from(str, 'base64url').toString('utf8');
+}
+function signToken(payload) {
+  const header = { alg: 'HS256', typ: 'JWT' };
+  const body = { ...payload, exp: Date.now() + TOKEN_EXPIRE };
+  const h = base64url(JSON.stringify(header));
+  const b = base64url(JSON.stringify(body));
+  const sig = crypto.createHmac('sha256', JWT_SECRET).update(h + '.' + b).digest('base64url');
+  return `${h}.${b}.${sig}`;
+}
+function verifyToken(token) {
+  try {
+    const [h, b, sig] = token.split('.');
+    if (!h || !b || !sig) return null;
+    const expect = crypto.createHmac('sha256', JWT_SECRET).update(h + '.' + b).digest('base64url');
+    if (expect !== sig) return null;
+    const payload = JSON.parse(base64urlDecode(b));
+    if (payload.exp < Date.now()) return null;
+    return payload;
+  } catch (e) {
+    return null;
+  }
+}
+
+// ==================== 数据库连接池与初始化 ====================
+let pool = null;
+
+/**
+ * 初始化数据库：
+ * 1. 若目标库不存在则创建
+ * 2. 建 users / soups 表（IF NOT EXISTS）
+ */
+async function initDatabase() {
+  // 先不带 database 连接，用于建库
+  const { database, ...serverConfig } = DB_CONFIG;
+  const conn = await mysql.createConnection(serverConfig);
+  await conn.query(
+    `CREATE DATABASE IF NOT EXISTS \`${database}\` DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci`
+  );
+  await conn.end();
+
+  // 用指定库建连接池
+  pool = mysql.createPool({ ...DB_CONFIG, waitForConnections: true, connectionLimit: 10 });
+
+  // 建表
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS users (
+      id            VARCHAR(36)  PRIMARY KEY,
+      username      VARCHAR(50)  NOT NULL UNIQUE,
+      salt          VARCHAR(32)  NOT NULL,
+      password_hash VARCHAR(64)  NOT NULL,
+      created_at    DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+  `);
+
+  // 用户陪玩引擎设置：每用户独立配置大模型（未开启时使用内置离线引擎）
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS user_settings (
+      user_id       VARCHAR(36)  PRIMARY KEY,
+      llm_enabled   TINYINT      NOT NULL DEFAULT 0,
+      llm_base_url  VARCHAR(300) NOT NULL DEFAULT '',
+      llm_model     VARCHAR(100) NOT NULL DEFAULT '',
+      llm_api_key   VARCHAR(300) NOT NULL DEFAULT '',
+      updated_at    DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS soups (
+      id          VARCHAR(36)  PRIMARY KEY,
+      title       VARCHAR(200) NOT NULL,
+      face        TEXT         NOT NULL,
+      bottom      TEXT         NOT NULL,
+      type        VARCHAR(10)  NOT NULL DEFAULT '清汤',
+      style       VARCHAR(10)  NOT NULL DEFAULT '本格',
+      difficulty  TINYINT      NOT NULL DEFAULT 1,
+      author_id   VARCHAR(36)  NOT NULL,
+      author_name VARCHAR(50)  NOT NULL,
+      created_at  DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      INDEX idx_created (created_at),
+      INDEX idx_author (author_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+  `);
+
+  // AI 陪玩存档：每用户每汤一份（覆盖式），保存后可继续游玩
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS game_saves (
+      id                 VARCHAR(36)  PRIMARY KEY,
+      user_id            VARCHAR(36)  NOT NULL,
+      soup_id            VARCHAR(36)  NOT NULL,
+      soup_title         VARCHAR(200) NOT NULL,
+      face               TEXT         NOT NULL,
+      bottom             TEXT         NOT NULL,
+      type               VARCHAR(10)  NOT NULL DEFAULT '清汤',
+      style              VARCHAR(10)  NOT NULL DEFAULT '本格',
+      diff_key           VARCHAR(20)  NOT NULL DEFAULT 'easy',
+      diff_label         VARCHAR(20)  NOT NULL DEFAULT '简单',
+      total_questions    INT          NOT NULL DEFAULT 0,
+      remaining_questions INT         NOT NULL DEFAULT 0,
+      remaining_seconds  INT          NOT NULL DEFAULT 0,
+      elapsed_seconds    INT          NOT NULL DEFAULT 0,
+      last_progress      INT          NOT NULL DEFAULT 0,
+      history_json       LONGTEXT,
+      created_at         DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at         DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      UNIQUE KEY uk_user_soup (user_id, soup_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+  `);
+
+  console.log(`✅ 数据库已就绪: ${database}@${DB_CONFIG.host}:${DB_CONFIG.port}`);
+}
+
+// ==================== 工具函数 ====================
+function sendJSON(res, status, obj) {
+  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
+  res.end(JSON.stringify(obj));
+}
+
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    req.on('data', (chunk) => {
+      chunks.push(chunk);
+      const total = chunks.reduce((n, c) => n + c.length, 0);
+      if (total > 10 * 1024 * 1024) {
+        reject(new Error('body too large'));
+        req.destroy();
+      }
+    });
+    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('error', reject);
+  });
+}
+
+function bodyToText(buf) {
+  return buf.toString('utf8');
+}
+
+function parseCookies(req) {
+  const cookies = {};
+  const raw = req.headers.cookie;
+  if (!raw) return cookies;
+  raw.split(';').forEach((kv) => {
+    const idx = kv.indexOf('=');
+    if (idx > 0) cookies[kv.slice(0, idx).trim()] = decodeURIComponent(kv.slice(idx + 1).trim());
+  });
+  return cookies;
+}
+
+function getAuthUser(req) {
+  const auth = req.headers.authorization;
+  if (auth && auth.startsWith('Bearer ')) {
+    return verifyToken(auth.slice(7));
+  }
+  const cookies = parseCookies(req);
+  if (cookies.token) {
+    return verifyToken(cookies.token);
+  }
+  return null;
+}
+
+// 数据库未就绪时的兜底提示
+function dbNotReady(res) {
+  return sendJSON(res, 503, { code: 503, message: '数据库未连接，请稍后重试' });
+}
+
+// ==================== 向量库入库（txt 上传 / 汤创建后自动执行） ====================
+/**
+ * 把一段汤内容切块后写入向量库
+ * @param {object} p { soupId, title, face, bottom, source: 'soup'|'upload', filename }
+ * @returns 入库条数（失败返回 0，不阻塞主流程）
+ */
+function ingestSoupContent({ soupId, title, face, bottom, source, filename }) {
+  try {
+    const base = {
+      soupId: soupId || null,
+      title: title || '',
+      source: source || 'soup',
+      filename: filename || '',
+    };
+    const idBase = `${base.source}:${soupId || filename || 'anon'}`;
+    const ids = [];
+    const docs = [];
+    const metas = [];
+
+    const titleText = (title || '').trim();
+    if (titleText) {
+      ids.push(`${idBase}:title`);
+      docs.push(titleText);
+      metas.push({ ...base, kind: 'title' });
+    }
+    chroma.chunkText(face).forEach((c, i) => {
+      ids.push(`${idBase}:face:${i}`);
+      docs.push(c);
+      metas.push({ ...base, kind: 'face' });
+    });
+    chroma.chunkText(bottom).forEach((c, i) => {
+      ids.push(`${idBase}:bottom:${i}`);
+      docs.push(c);
+      metas.push({ ...base, kind: 'bottom' });
+    });
+
+    if (!docs.length) return 0;
+    chroma.add(VECTOR_COLLECTION, { ids, documents: docs, metadatas: metas });
+    console.log(`[chroma] 已入向量库 ${docs.length} 条（source=${base.source}）`);
+    return docs.length;
+  } catch (e) {
+    console.error('[chroma] 入库失败:', e.message);
+    return 0;
+  }
+}
+
+// ==================== 路由分发 ====================
+const server = http.createServer(async (req, res) => {
+  const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+  const pathname = url.pathname;
+  const method = req.method.toUpperCase();
+
+  try {
+    // 健康检查
+    if (method === 'GET' && pathname === '/healthz') {
+      const dbOk = pool ? 'ok' : 'down';
+      return sendJSON(res, 200, { code: 0, status: 'ok', db: dbOk, uptime: process.uptime() });
+    }
+
+    // 鉴权接口（无需登录）
+    if (method === 'POST' && pathname === '/api/register') return await handleRegister(req, res);
+    if (method === 'POST' && pathname === '/api/login') return await handleLogin(req, res);
+    if (method === 'POST' && pathname === '/api/logout') return handleLogout(res);
+    if (method === 'GET' && pathname === '/api/me') return handleMe(req, res);
+
+    // 海龟汤接口（需登录）
+    if (pathname.startsWith('/api/soups')) {
+      const user = getAuthUser(req);
+      if (!user) return sendJSON(res, 401, { code: 401, message: '未登录或登录已过期，请先登录' });
+      req.authUser = user;
+
+      if (method === 'GET' && pathname === '/api/soups') return handleListSoups(req, res, url);
+      if (method === 'GET' && pathname === '/api/soups/types') return handleGetTypes(req, res);
+      if (method === 'POST' && pathname === '/api/soups') return await handleCreateSoup(req, res);
+      if (method === 'GET' && /^\/api\/soups\/[\w-]+$/.test(pathname)) {
+        return handleGetSoup(req, res, pathname.split('/').pop());
+      }
+      if (method === 'PUT' && /^\/api\/soups\/[\w-]+$/.test(pathname)) {
+        return await handleUpdateSoup(req, res, pathname.split('/').pop());
+      }
+      if (method === 'DELETE' && /^\/api\/soups\/[\w-]+$/.test(pathname)) {
+        return handleDeleteSoup(req, res, pathname.split('/').pop());
+      }
+    }
+
+    // 上传文件接口（需登录）
+    if (method === 'POST' && pathname === '/api/upload') {
+      const user = getAuthUser(req);
+      if (!user) return sendJSON(res, 401, { code: 401, message: '未登录，请先登录' });
+      return await handleUpload(req, res);
+    }
+
+    // ---------- AI 陪玩接口（需登录） ----------
+    if (pathname.startsWith('/api/ai/')) {
+      const user = getAuthUser(req);
+      if (!user) return sendJSON(res, 401, { code: 401, message: '未登录，请先登录' });
+      req.authUser = user; // 存档等接口需要 uid
+
+      // 引擎设置（每用户独立配置大模型 / 离线引擎）
+      if (method === 'GET' && pathname === '/api/ai/settings') {
+        return await handleAIGetSettings(req, res);
+      }
+      if (method === 'PUT' && pathname === '/api/ai/settings') {
+        return await handleAISaveSettings(req, res);
+      }
+      if (method === 'POST' && pathname === '/api/ai/settings/test') {
+        return await handleAITestSettings(req, res);
+      }
+
+      if (method === 'POST' && pathname === '/api/ai/ask') {
+        return await handleAIAsk(req, res);
+      }
+      if (method === 'POST' && pathname === '/api/ai/shorten') {
+        return await handleAIShorten(req, res);
+      }
+      // 陪玩存档（保存进度 / 继续游玩）
+      if (method === 'POST' && pathname === '/api/ai/save') {
+        return await handleAISave(req, res);
+      }
+      if (method === 'GET' && pathname === '/api/ai/saves') {
+        return await handleAIListSaves(req, res);
+      }
+      if (method === 'GET' && /^\/api\/ai\/save\/[\w-]+$/.test(pathname)) {
+        return await handleAIGetSave(req, res, pathname.split('/').pop());
+      }
+    }
+
+    // 静态资源
+    return serveStatic(req, res, pathname);
+  } catch (e) {
+    console.error('server error:', e);
+    return sendJSON(res, 500, { code: 500, message: '服务器内部错误' });
+  }
+});
+
+// ==================== 用户注册 ====================
+async function handleRegister(req, res) {
+  if (!pool) return dbNotReady(res);
+  const payload = safeJSON(bodyToText(await readBody(req)));
+  if (payload === null) return sendJSON(res, 400, { code: 400, message: '请求格式错误' });
+
+  const username = (payload.username || '').trim();
+  const password = (payload.password || '');
+
+  if (!username || !password) return sendJSON(res, 400, { code: 400, message: '用户名和密码不能为空' });
+  if (username.length < 2 || username.length > 20) return sendJSON(res, 400, { code: 400, message: '用户名长度需在 2~20 个字符之间' });
+  if (password.length < 4) return sendJSON(res, 400, { code: 400, message: '密码长度至少 4 位' });
+
+  try {
+    const [rows] = await pool.query('SELECT id FROM users WHERE username = ?', [username]);
+    if (rows.length > 0) return sendJSON(res, 409, { code: 409, message: '该用户名已被注册' });
+
+    const salt = genSalt();
+    const id = crypto.randomUUID();
+    await pool.query(
+      'INSERT INTO users (id, username, salt, password_hash) VALUES (?, ?, ?, ?)',
+      [id, username, salt, hashPassword(password, salt)]
+    );
+    return sendJSON(res, 200, { code: 0, message: '注册成功，请登录' });
+  } catch (e) {
+    console.error('register error:', e);
+    return sendJSON(res, 500, { code: 500, message: '注册失败，请稍后重试' });
+  }
+}
+
+// ==================== 用户登录 ====================
+async function handleLogin(req, res) {
+  if (!pool) return dbNotReady(res);
+  const payload = safeJSON(bodyToText(await readBody(req)));
+  if (payload === null) return sendJSON(res, 400, { code: 400, message: '请求格式错误' });
+
+  const username = (payload.username || '').trim();
+  const password = (payload.password || '');
+
+  try {
+    const [rows] = await pool.query('SELECT * FROM users WHERE username = ?', [username]);
+    const user = rows[0];
+    if (!user || hashPassword(password, user.salt) !== user.password_hash) {
+      return sendJSON(res, 401, { code: 401, message: '登录失败：用户名或密码错误' });
+    }
+
+    const token = signToken({ uid: user.id, username: user.username });
+    res.setHeader('Set-Cookie', `token=${token}; HttpOnly; Path=/; Max-Age=${TOKEN_EXPIRE / 1000}; SameSite=Lax`);
+    return sendJSON(res, 200, { code: 0, message: '登录成功', data: { token, username: user.username } });
+  } catch (e) {
+    console.error('login error:', e);
+    return sendJSON(res, 500, { code: 500, message: '登录失败，请稍后重试' });
+  }
+}
+
+function handleLogout(res) {
+  res.setHeader('Set-Cookie', `token=; HttpOnly; Path=/; Max-Age=0; SameSite=Lax`);
+  return sendJSON(res, 200, { code: 0, message: '已退出登录' });
+}
+
+function handleMe(req, res) {
+  const user = getAuthUser(req);
+  if (!user) return sendJSON(res, 401, { code: 401, message: '未登录' });
+  return sendJSON(res, 200, { code: 0, data: { uid: user.uid, username: user.username } });
+}
+
+// ==================== 海龟汤 CRUD ====================
+// 全局共享：不按用户过滤，所有登录用户看到同一份全量数据
+// 分页：带 page/pageSize 参数时返回分页结果；不带参数时返回全量（兼容 AI 选汤页）
+async function handleListSoups(req, res, url) {
+  if (!pool) return dbNotReady(res);
+  try {
+    const qs = url && url.searchParams ? url.searchParams : new URLSearchParams();
+    const hasPaging = qs.has('pageSize');
+    let page = Math.max(1, parseInt(qs.get('page'), 10) || 1);
+    const pageSize = hasPaging
+      ? Math.min(50, Math.max(1, parseInt(qs.get('pageSize'), 10) || 10))
+      : null;
+
+    const selectFields =
+      'SELECT id, title, type, style, difficulty, author_id, author_name, created_at FROM soups';
+    const orderClause = ' ORDER BY created_at DESC, id DESC';
+
+    let rows;
+    let total = 0;
+    let totalPages = 1;
+    if (hasPaging) {
+      const [countRows] = await pool.query('SELECT COUNT(*) AS c FROM soups');
+      total = Number(countRows[0].c) || 0;
+      totalPages = Math.max(1, Math.ceil(total / pageSize));
+      page = Math.min(page, totalPages);
+      const [pageRows] = await pool.query(
+        `${selectFields}${orderClause} LIMIT ? OFFSET ?`,
+        [pageSize, (page - 1) * pageSize]
+      );
+      rows = pageRows;
+    } else {
+      const [allRows] = await pool.query(`${selectFields}${orderClause}`);
+      rows = allRows;
+      total = rows.length;
+    }
+
+    const list = rows.map((r) => ({
+      id: r.id,
+      title: r.title,
+      type: r.type,
+      style: r.style,
+      difficulty: r.difficulty,
+      authorId: r.author_id,
+      author: r.author_name,
+      createdAt: r.created_at,
+    }));
+    return sendJSON(res, 200, {
+      code: 0,
+      data: { list, total, page: hasPaging ? page : 1, pageSize: hasPaging ? pageSize : total, totalPages },
+    });
+  } catch (e) {
+    console.error('list error:', e);
+    return sendJSON(res, 500, { code: 500, message: '查询失败' });
+  }
+}
+
+function handleGetTypes(req, res) {
+  return sendJSON(res, 200, { code: 0, data: { types: ['清汤', '红汤'], styles: ['本格', '变格'] } });
+}
+
+async function handleCreateSoup(req, res) {
+  if (!pool) return dbNotReady(res);
+  const payload = safeJSON(bodyToText(await readBody(req)));
+  if (payload === null) return sendJSON(res, 400, { code: 400, message: '请求格式错误' });
+
+  const title = (payload.title || '').trim();
+  const face = (payload.face || '').trim();
+  const bottom = (payload.bottom || '').trim();
+  const type = payload.type || '清汤';
+  const style = payload.style || '本格';
+  const difficulty = Number(payload.difficulty) || 1;
+
+  if (!title) return sendJSON(res, 400, { code: 400, message: '请填写汤名' });
+  if (!face) return sendJSON(res, 400, { code: 400, message: '请填写汤面（谜面）' });
+  if (!bottom) return sendJSON(res, 400, { code: 400, message: '请填写汤底（答案）' });
+  if (!['清汤', '红汤'].includes(type)) return sendJSON(res, 400, { code: 400, message: '类型不正确' });
+  if (!['本格', '变格'].includes(style)) return sendJSON(res, 400, { code: 400, message: '风格不正确' });
+  if (difficulty < 1 || difficulty > 5) return sendJSON(res, 400, { code: 400, message: '难度需在 1~5 星之间' });
+
+  const id = crypto.randomUUID();
+  try {
+    await pool.query(
+      `INSERT INTO soups (id, title, face, bottom, type, style, difficulty, author_id, author_name)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [id, title, face, bottom, type, style, difficulty, req.authUser.uid, req.authUser.username]
+    );
+    // 汤入库的同时自动入向量库
+    ingestSoupContent({ soupId: id, title, face, bottom, source: 'soup' });
+    return sendJSON(res, 200, { code: 0, message: '添加成功', data: { id } });
+  } catch (e) {
+    console.error('create error:', e);
+    return sendJSON(res, 500, { code: 500, message: '添加失败' });
+  }
+}
+
+async function handleGetSoup(req, res, id) {
+  if (!pool) return dbNotReady(res);
+  try {
+    const [rows] = await pool.query(
+      `SELECT id, title, face, bottom, type, style, difficulty, author_id, author_name, created_at
+       FROM soups WHERE id = ?`,
+      [id]
+    );
+    const s = rows[0];
+    if (!s) return sendJSON(res, 404, { code: 404, message: '未找到该海龟汤' });
+    return sendJSON(res, 200, {
+      code: 0,
+      data: {
+        id: s.id,
+        title: s.title,
+        face: s.face,
+        bottom: s.bottom,
+        type: s.type,
+        style: s.style,
+        difficulty: s.difficulty,
+        authorId: s.author_id,
+        author: s.author_name,
+        createdAt: s.created_at,
+      },
+    });
+  } catch (e) {
+    console.error('get error:', e);
+    return sendJSON(res, 500, { code: 500, message: '查询失败' });
+  }
+}
+
+async function handleDeleteSoup(req, res, id) {
+  if (!pool) return dbNotReady(res);
+  try {
+    const [rows] = await pool.query('SELECT author_id FROM soups WHERE id = ?', [id]);
+    if (rows.length === 0) return sendJSON(res, 404, { code: 404, message: '未找到该海龟汤' });
+    // 仅创建者本人可删除
+    if (rows[0].author_id !== req.authUser.uid) {
+      return sendJSON(res, 403, { code: 403, message: '只能删除自己添加的海龟汤' });
+    }
+    await pool.query('DELETE FROM soups WHERE id = ?', [id]);
+    return sendJSON(res, 200, { code: 0, message: '删除成功' });
+  } catch (e) {
+    console.error('delete error:', e);
+    return sendJSON(res, 500, { code: 500, message: '删除失败' });
+  }
+}
+
+async function handleUpdateSoup(req, res, id) {
+  if (!pool) return dbNotReady(res);
+  const payload = safeJSON(bodyToText(await readBody(req)));
+  if (payload === null) return sendJSON(res, 400, { code: 400, message: '请求格式错误' });
+
+  const title = (payload.title || '').trim();
+  const face = (payload.face || '').trim();
+  const bottom = (payload.bottom || '').trim();
+  const type = payload.type || '清汤';
+  const style = payload.style || '本格';
+  const difficulty = Number(payload.difficulty) || 1;
+
+  if (!title) return sendJSON(res, 400, { code: 400, message: '请填写汤名' });
+  if (!face) return sendJSON(res, 400, { code: 400, message: '请填写汤面（谜面）' });
+  if (!bottom) return sendJSON(res, 400, { code: 400, message: '请填写汤底（答案）' });
+  if (!['清汤', '红汤'].includes(type)) return sendJSON(res, 400, { code: 400, message: '类型不正确' });
+  if (!['本格', '变格'].includes(style)) return sendJSON(res, 400, { code: 400, message: '风格不正确' });
+  if (difficulty < 1 || difficulty > 5) return sendJSON(res, 400, { code: 400, message: '难度需在 1~5 星之间' });
+
+  try {
+    const [rows] = await pool.query('SELECT author_id FROM soups WHERE id = ?', [id]);
+    if (rows.length === 0) return sendJSON(res, 404, { code: 404, message: '未找到该海龟汤' });
+    // 仅创建者本人可修改
+    if (rows[0].author_id !== req.authUser.uid) {
+      return sendJSON(res, 403, { code: 403, message: '只能修改自己添加的海龟汤' });
+    }
+    await pool.query(
+      `UPDATE soups SET title = ?, face = ?, bottom = ?, type = ?, style = ?, difficulty = ?
+       WHERE id = ?`,
+      [title, face, bottom, type, style, difficulty, id]
+    );
+    // 汤内容变更：先清掉旧向量再重新入库
+    chroma.deleteWhere(VECTOR_COLLECTION, (meta) => meta && meta.soupId === id);
+    ingestSoupContent({ soupId: id, title, face, bottom, source: 'soup' });
+    return sendJSON(res, 200, { code: 0, message: '保存成功' });
+  } catch (e) {
+    console.error('update error:', e);
+    return sendJSON(res, 500, { code: 500, message: '保存失败' });
+  }
+}
+
+// ==================== txt 文件上传（解析为汤面+汤底） ====================
+async function handleUpload(req, res) {
+  const contentType = req.headers['content-type'] || '';
+  if (!contentType.includes('multipart/form-data')) {
+    return sendJSON(res, 400, { code: 400, message: '请以 multipart/form-data 上传文件' });
+  }
+  const boundary = contentType.split('boundary=')[1];
+  if (!boundary) return sendJSON(res, 400, { code: 400, message: '缺少 boundary' });
+
+  const raw = bodyToText(await readBody(req));
+  const parts = raw.split(`--${boundary}`);
+  let filename = '';
+  let fileContent = '';
+  for (const part of parts) {
+    if (!part.includes('Content-Disposition')) continue;
+    const headerEnd = part.indexOf('\r\n\r\n');
+    if (headerEnd === -1) continue;
+    const header = part.slice(0, headerEnd);
+    const body = part.slice(headerEnd + 4).replace(/\r\n$/, '');
+    const fileMatch = header.match(/filename="([^"]*)"/);
+    if (fileMatch) {
+      filename = fileMatch[1];
+      fileContent = body;
+    }
+  }
+
+  if (!filename || !fileContent) return sendJSON(res, 400, { code: 400, message: '未检测到文件内容' });
+  const ext = path.extname(filename).toLowerCase();
+  if (ext !== '.txt') return sendJSON(res, 400, { code: 400, message: '仅支持 .txt 格式的文件' });
+
+  // 保存原始文件
+  fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+  fs.writeFileSync(path.join(UPLOAD_DIR, `${crypto.randomUUID()}${ext}`), fileContent, 'utf8');
+
+  // 解析文本
+  const content = fileContent.replace(/\r\n/g, '\n').trim();
+  let face = content;
+  let bottom = '';
+  let title = '';
+
+  const sepPattern = /(?:^|\n)(?:汤底|答案|谜底)\s*[:：]?\s*\n|(?:^|\n)={3,}\s*\n|(?:^|\n)-{3,}\s*\n/;
+  const sepMatch = content.match(sepPattern);
+  if (sepMatch) {
+    const idx = content.indexOf(sepMatch[0]);
+    face = content.slice(0, idx).trim();
+    bottom = content.slice(idx + sepMatch[0].length).trim();
+  }
+
+  const lines = face.split('\n').filter((l) => l.trim());
+  if (lines.length > 0 && lines[0].trim().length <= 30) {
+    title = lines[0].trim();
+    face = lines.slice(1).join('\n').trim();
+  }
+  face = face.replace(/^(汤面|谜面)\s*[:：]\s*/i, '').trim();
+
+  return sendJSON(res, 200, { code: 0, message: '上传成功，已解析', data: { title, face, bottom, filename } });
+}
+
+// ==================== 工具：安全 JSON 解析 ====================
+function safeJSON(str) {
+  try {
+    return JSON.parse(str || '{}');
+  } catch (e) {
+    return null;
+  }
+}
+
+// ==================== 静态资源服务 ====================
+const MIME = {
+  '.html': 'text/html; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.js': 'application/javascript; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.gif': 'image/gif',
+  '.svg': 'image/svg+xml',
+  '.ico': 'image/x-icon',
+  '.txt': 'text/plain; charset=utf-8',
+};
+
+function serveStatic(req, res, pathname) {
+  let filePath = pathname === '/' ? '/index.html' : pathname;
+  filePath = path.normalize(filePath).replace(/^(\.\.[/\\])+/, '');
+  const fullPath = path.join(__dirname, 'public', filePath);
+
+  if (!fullPath.startsWith(path.join(__dirname, 'public'))) {
+    return sendJSON(res, 403, { code: 403, message: '禁止访问' });
+  }
+
+  fs.readFile(fullPath, (err, data) => {
+    if (err) {
+      fs.readFile(path.join(__dirname, 'public', 'index.html'), (err2, html) => {
+        if (err2) return sendJSON(res, 404, { code: 404, message: 'Not Found' });
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(html);
+      });
+      return;
+    }
+    const ext = path.extname(fullPath).toLowerCase();
+    res.writeHead(200, { 'Content-Type': MIME[ext] || 'application/octet-stream' });
+    res.end(data);
+  });
+}
+
+// ==================== AI 陪玩 ====================
+// 调用用户指定的 OpenAI 兼容 LLM（用户提供 base url + api key）
+// 职责：扮演汤主回答问题（只答是/否/无关紧要/是或不是），并评估推理进度
+
+// 调用 OpenAI 兼容的 Chat Completions 接口
+// opts: { temperature, maxTokens, timeoutMs } — 进度智能体等调用方可用小参数，缺省与原逻辑一致
+async function callLLM(baseUrl, apiKey, model, messages, opts) {
+  const temperature = opts && typeof opts.temperature === 'number' ? opts.temperature : 0.3;
+  const maxTokens = opts && opts.maxTokens ? opts.maxTokens : 500;
+  const timeoutMs = opts && opts.timeoutMs ? opts.timeoutMs : 60000;
+
+  let url = baseUrl.trim();
+  // 去掉末尾斜杠
+  url = url.replace(/\/+$/, '');
+  // 若用户给的是完整 chat/completions 路径则直接用，否则拼接
+  if (!/\/chat\/completions$/.test(url)) {
+    if (/\/v1$/.test(url)) {
+      url = url + '/chat/completions';
+    } else {
+      url = url + '/v1/chat/completions';
+    }
+  }
+
+  const body = JSON.stringify({
+    model: model || 'gpt-4o-mini',
+    messages,
+    temperature,
+    max_tokens: maxTokens,
+  });
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer ' + apiKey.trim(),
+      },
+      body,
+      signal: controller.signal,
+    });
+    clearTimeout(timeout);
+
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      throw new Error('AI 接口返回错误 ' + res.status + (text ? '：' + text.slice(0, 200) : ''));
+    }
+    const data = await res.json();
+    const content = data && data.choices && data.choices[0] && data.choices[0].message
+      ? data.choices[0].message.content
+      : '';
+    return String(content || '').trim();
+  } catch (e) {
+    clearTimeout(timeout);
+    if (e.name === 'AbortError') throw new Error('AI 请求超时，请稍后重试');
+    throw e;
+  }
+}
+
+// 构建汤主系统提示词
+function buildHostPrompt(face, bottom) {
+  return `你正在主持一场「海龟汤」情境推理游戏，你是出题人（汤主）。
+
+【汤面】（你只向玩家公布这段事件摘要）：
+${face}
+
+【汤底】（这是完整的故事真相，只有你知道，绝不能直接告诉玩家）：
+${bottom}
+
+【你的职责】
+玩家会通过「是/否」封闭式提问来逐步还原事件真相。你需要根据汤底，对玩家的问题做出判断并回答。
+
+【回答规范——只能从以下四种中选择一种，严格执行】
+- 回答「是」：玩家的说法符合汤底事实
+- 回答「否」：玩家的说法与汤底事实相反
+- 回答「无关紧要」：该信息不影响故事主线，知不知道都不影响推出汤底
+- 回答「是或不是」：问题半对半错，一部分成立一部分不成立
+
+【严格禁止】
+- 禁止直接说出汤底、人物动机、关键事件、结局的直接原因
+- 禁止主动提示线索、禁止补充解释、禁止长篇回答
+- 只回答上面四种中的一种，不要展开任何额外说明
+- 玩家问开放式问题（如"为什么""他是谁"等）时，不要回答具体内容，引导玩家改成是/否问题，或者回答「无关紧要」
+
+【输出格式】
+你必须严格输出如下 JSON（不要输出 JSON 以外的任何文字、不要用代码块包裹）：
+{"answer":"是/否/无关紧要/是或不是 四选一","progress":0到100的整数}
+
+其中 progress 是你对玩家当前已还原真相程度的评估（0 表示毫无头绪，100 表示完整还原了人物、核心动机、关键触发事件、结局直接原因）。progress 根据玩家累计的提问内容综合判断。`;
+}
+
+// 玩家累计对话转 messages
+function buildMessages(history) {
+  const messages = [];
+  for (const turn of history) {
+    messages.push({ role: 'user', content: turn.question });
+    messages.push({ role: 'assistant', content: turn.answer });
+  }
+  return messages;
+}
+
+// ==================== 推理进度智能体 ====================
+// 独立的轻量 Agent：职责单一——根据玩家累计问答，实时评估推理还原进度（0~100）。
+// 与汤主回答完全解耦（原回答逻辑不变）；失败自动降级链：
+//   智能体评估 → 汤主回答自带的 progress → 本地启发式估算 → 前端保留上一次进度
+// 解析与本地估算的纯函数实现见 progress-utils.js
+
+async function runProgressAgent(baseUrl, apiKey, model, face, bottom, history) {
+  const convo = history
+    .slice(-20) // 控制上下文长度，最近的 20 轮问答足以评估
+    .map((t, i) => `${i + 1}. 玩家问：${t.question}\n   汤主答：${t.answer}`)
+    .join('\n');
+
+  const messages = [
+    {
+      role: 'system',
+      content: `你是「海龟汤」游戏的推理进度评估智能体。你的唯一职责：根据玩家的全部问答记录，评估玩家对汤底真相的还原程度，输出 0~100 的整数进度。
+
+【评估检查表】逐项判断玩家是否已通过提问获得确定性确认：
+1. 核心人物 / 对象的身份
+2. 关键动机
+3. 关键事件的经过
+4. 结局的直接原因
+5. 决定性的转折点
+
+【评分规则】
+- 玩家每获得一个与主线相关的「是」确认，进度至少前进 8~12 分，禁止在已有相关确认时输出 0
+- 毫无头绪：0~15
+- 仅触及表面事实：16~25
+- 已确认 1 个关键点：26~50
+- 已确认 2~3 个关键点：51~75
+- 已确认 4 个以上关键点：76~90
+- 关键点基本全部确认，只差完整还原：91~100
+- 只统计玩家从回答中获得的确定性信息，不要因提问次数多而虚高
+- 玩家得到「否 / 无关紧要」的回答同样排除了错误方向，可小幅加分
+
+【输出格式】直接输出 JSON（尽量简短，确保完整）：{"progress": 整数}，禁止输出任何其他文字或代码块`,
+    },
+    {
+      role: 'user',
+      content: `【汤面】\n${face}\n\n【汤底】\n${bottom}\n\n【玩家问答记录（最新在最后）】\n${convo || '（暂无问答）'}\n\n只输出：{"progress": 数字}`,
+    },
+  ];
+
+  // 失败重试 1 次，再失败返回 null（由调用方降级）
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const raw = await callLLM(baseUrl, apiKey, model, messages, {
+        temperature: 0.2,
+        maxTokens: 500,   // 此前 120 会把回复截断成残缺 JSON，导致解析必然失败
+        timeoutMs: 45000,
+      });
+      const p = parseProgressFromText(raw);
+      if (p !== null) return p;
+      console.error(`progress agent: attempt ${attempt} 无法从回复中解析进度，原文片段: ${String(raw).slice(0, 120)}`);
+    } catch (e) {
+      console.error(`progress agent error (attempt ${attempt}):`, e.message);
+    }
+  }
+  return null;
+}
+
+async function handleAIAsk(req, res) {
+  const payload = safeJSON(bodyToText(await readBody(req)));
+  if (payload === null) return sendJSON(res, 400, { code: 400, message: '请求格式错误' });
+
+  const { face, bottom, history } = payload;
+  const soupId = payload.soupId || null; // 当前游玩的汤 id，用于检索时优先本汤内容
+  const question = (payload.question || '').trim();
+
+  if (!face || !bottom) {
+    return sendJSON(res, 400, { code: 400, message: '缺少汤面或汤底' });
+  }
+  if (!question) {
+    return sendJSON(res, 400, { code: 400, message: '问题不能为空' });
+  }
+
+  // —— 引擎选择：优先读服务端每用户设置；前端仍可传 baseUrl/apiKey 作为兜底 ——
+  // 1) 服务端 user_settings 里开启了 llm 且有完整配置 → 用大模型
+  // 2) 否则用 payload 里带的大模型配置（兼容旧前端 / 未配置设置页时）
+  // 3) 都没有 → 离线引擎
+  let llmCfg = null;
+  try {
+    const [rows] = await pool.query(
+      'SELECT llm_enabled, llm_base_url, llm_model, llm_api_key FROM user_settings WHERE user_id = ?',
+      [req.authUser.uid]
+    );
+    const s = rows[0];
+    if (s && s.llm_enabled && s.llm_base_url && s.llm_api_key) {
+      llmCfg = { baseUrl: s.llm_base_url, apiKey: s.llm_api_key, model: s.llm_model || '' };
+    }
+  } catch (e) {
+    console.error('read user_settings error:', e.message);
+  }
+  if (!llmCfg) {
+    // 兜底：前端传的配置
+    if (payload.baseUrl && payload.apiKey) {
+      llmCfg = { baseUrl: payload.baseUrl, apiKey: payload.apiKey, model: payload.model || '' };
+    }
+  }
+
+  const baseUrl = llmCfg ? llmCfg.baseUrl : '';
+  const apiKey = llmCfg ? llmCfg.apiKey : '';
+  const model = llmCfg ? llmCfg.model : '';
+
+  // 上一轮进度（离线引擎需要，用于进度单调递增）
+  let prevProgress = 0;
+  try {
+    prevProgress = Number(payload.lastProgress) || 0;
+  } catch (e) { prevProgress = 0; }
+  const fullHistory = (Array.isArray(history) ? history : []).concat([{ question, answer: '是' }]);
+
+  // —— 路径 A：离线引擎（未配大模型，或大模型失败时回退到这里）——
+  if (!llmCfg) {
+    try {
+      const r = offlineEngine.offlineJudge(face, bottom, question, prevProgress);
+      return sendJSON(res, 200, {
+        code: 0,
+        data: {
+          answer: r.answer,
+          progress: r.progress,
+          engine: 'offline',
+          agentProgress: null,
+          raw: '',
+        },
+      });
+    } catch (e) {
+      console.error('offline engine error:', e.message);
+      return sendJSON(res, 500, { code: 500, message: '离线引擎异常' });
+    }
+  }
+
+  // —— 路径 B：大模型引擎（失败回退离线）——
+  try {
+    // —— 向量相似检索：用玩家问题在向量库中召回语义最相关的文本片段 ——
+    // 检索失败不影响主流程（降级为无检索参考，原回答逻辑兜底）
+    let contextBlock = '';
+    try {
+      const hits = chroma.query(VECTOR_COLLECTION, { queryText: question, n: 8 });
+      if (hits.length) {
+        // 当前这碗汤的片段优先，其次按相似度
+        hits.sort((a, b) => {
+          const am = a.meta && a.meta.soupId && a.meta.soupId === soupId ? 1 : 0;
+          const bm = b.meta && b.meta.soupId && b.meta.soupId === soupId ? 1 : 0;
+          if (am !== bm) return bm - am;
+          return b.score - a.score;
+        });
+        const seen = new Set();
+        const picked = [];
+        for (const h of hits) {
+          const key = String(h.text).slice(0, 60);
+          if (seen.has(key)) continue;
+          seen.add(key);
+          picked.push(h);
+          if (picked.length >= 4) break;
+        }
+        const kindMap = { title: '汤名', face: '汤面', bottom: '汤底' };
+        const lines = picked
+          .filter((h) => h.score > 0.12) // 过滤弱相关的召回（实测强相关 >0.3，不相关 <0.1）
+          .map((h, i) => {
+            const kind = h.meta && h.meta.kind ? kindMap[h.meta.kind] || '片段' : '片段';
+            return `${i + 1}. [${kind}] ${h.text}`;
+          });
+        if (lines.length) {
+          contextBlock =
+            '\n\n【向量库检索参考】（以下是从海龟汤知识库中按语义相似度召回的片段，供你判断玩家问题时对照事实使用，不得直接照读给玩家）：\n' +
+            lines.join('\n');
+        }
+      }
+    } catch (e) {
+      console.error('vector retrieval error:', e.message);
+    }
+
+    // —— 汤主回答（原逻辑不变，仅追加了检索参考上下文）——
+    const sysPrompt = buildHostPrompt(face, bottom) + contextBlock;
+    const messages = [
+      { role: 'system', content: sysPrompt },
+      ...buildMessages(Array.isArray(history) ? history : []),
+      { role: 'user', content: question },
+    ];
+
+    const raw = await callLLM(baseUrl, apiKey, model, messages);
+
+    // 解析 AI 返回的 JSON
+    let parsed = null;
+    try {
+      // 去除可能的代码块包裹
+      let cleaned = raw.replace(/```json/gi, '').replace(/```/g, '').trim();
+      const match = cleaned.match(/\{[\s\S]*\}/);
+      if (match) cleaned = match[0];
+      parsed = JSON.parse(cleaned);
+    } catch (e) {
+      // 解析失败：退回保守处理，answer 取原文，progress 给 -1 表示未知
+    }
+
+    let answer = parsed && parsed.answer ? String(parsed.answer) : '无关紧要';
+    let progress = parsed && typeof parsed.progress === 'number' ? parsed.progress : -1;
+
+    // 规范化 answer
+    if (!['是', '否', '无关紧要', '是或不是'].includes(answer)) {
+      if (/是或不是|半对|部分/.test(answer)) answer = '是或不是';
+      else if (/无关|不重要|无关紧要/.test(answer)) answer = '无关紧要';
+      else if (/^否/.test(answer)) answer = '否';
+      else answer = '是';
+    }
+    if (progress < 0 || progress > 100) progress = -1;
+
+    // —— 推理进度智能体：独立实时评估（汤主回答逻辑不受影响）——
+    let agentProgress = null;
+    try {
+      const h2 = (Array.isArray(history) ? history : []).concat([{ question, answer }]);
+      agentProgress = await runProgressAgent(baseUrl, apiKey, model, face, bottom, h2);
+    } catch (e) {
+      agentProgress = null;
+    }
+
+    // 三级进度来源取最大值：进度代表"已还原的信息量"，已确认的事实不会消失，因此单调不减。
+    // 智能体评估（最准）> 汤主自带评估 > 本地启发式估算（保证进度条永远会动）
+    const candidates = [estimateProgressLocally((Array.isArray(history) ? history : []).concat([{ question, answer }]))];
+    if (agentProgress !== null) candidates.push(agentProgress);
+    if (progress >= 0 && progress <= 100) candidates.push(progress); // 汤主自带的
+    progress = Math.max(...candidates);
+    if (progress < 0 || progress > 100) progress = -1;
+
+    return sendJSON(res, 200, {
+      code: 0,
+      data: { answer, progress, engine: 'llm', agentProgress, raw },
+    });
+  } catch (e) {
+    // 大模型失败 → 回退离线引擎（不影响游戏）
+    console.error('llm ask error, fallback to offline:', e.message);
+    try {
+      const r = offlineEngine.offlineJudge(face, bottom, question, prevProgress);
+      return sendJSON(res, 200, {
+        code: 0,
+        data: { answer: r.answer, progress: r.progress, engine: 'offline', agentProgress: null, raw: '', fallback: true },
+      });
+    } catch (e2) {
+      console.error('offline fallback error:', e2.message);
+      return sendJSON(res, 502, { code: 502, message: 'AI 调用失败：' + e.message });
+    }
+  }
+}
+
+// ==================== 陪玩引擎设置（每用户） ====================
+async function handleAIGetSettings(req, res) {
+  if (!pool) return dbNotReady(res);
+  try {
+    const [rows] = await pool.query(
+      'SELECT llm_enabled, llm_base_url, llm_model, llm_api_key FROM user_settings WHERE user_id = ?',
+      [req.authUser.uid]
+    );
+    const s = rows[0] || { llm_enabled: 0, llm_base_url: '', llm_model: '', llm_api_key: '' };
+    return sendJSON(res, 200, {
+      code: 0,
+      data: {
+        settings: {
+          enabled: !!s.llm_enabled,
+          llmBaseUrl: s.llm_base_url || '',
+          llmModel: s.llm_model || '',
+          llmApiKey: s.llm_api_key || '',
+          hasKey: !!s.llm_api_key,
+        },
+      },
+    });
+  } catch (e) {
+    console.error('get settings error:', e);
+    return sendJSON(res, 500, { code: 500, message: '读取设置失败' });
+  }
+}
+
+async function handleAISaveSettings(req, res) {
+  if (!pool) return dbNotReady(res);
+  const payload = safeJSON(bodyToText(await readBody(req)));
+  if (payload === null) return sendJSON(res, 400, { code: 400, message: '请求格式错误' });
+  const enabled = payload.enabled ? 1 : 0;
+  const llmBaseUrl = String(payload.llmBaseUrl || '').trim().slice(0, 300);
+  const llmModel = String(payload.llmModel || '').trim().slice(0, 100);
+  const llmApiKey = String(payload.llmApiKey || '').trim().slice(0, 300);
+
+  if (enabled && (!llmBaseUrl || !llmApiKey)) {
+    return sendJSON(res, 400, { code: 400, message: '开启大模型主持需填写接口地址和 API Key' });
+  }
+
+  try {
+    await pool.query(
+      `INSERT INTO user_settings (user_id, llm_enabled, llm_base_url, llm_model, llm_api_key)
+       VALUES (?, ?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE
+         llm_enabled = VALUES(llm_enabled), llm_base_url = VALUES(llm_base_url),
+         llm_model = VALUES(llm_model), llm_api_key = VALUES(llm_api_key)`,
+      [req.authUser.uid, enabled, llmBaseUrl, llmModel, llmApiKey]
+    );
+    return sendJSON(res, 200, { code: 0, message: '设置已保存' });
+  } catch (e) {
+    console.error('save settings error:', e);
+    return sendJSON(res, 500, { code: 500, message: '保存设置失败' });
+  }
+}
+
+// 测试大模型连接：用最小请求验证 baseUrl + key + model 是否可用
+async function handleAITestSettings(req, res) {
+  const payload = safeJSON(bodyToText(await readBody(req)));
+  if (payload === null) return sendJSON(res, 400, { code: 400, message: '请求格式错误' });
+  const baseUrl = String(payload.llmBaseUrl || '').trim();
+  const apiKey = String(payload.llmApiKey || '').trim();
+  const model = String(payload.llmModel || '').trim();
+  if (!baseUrl || !apiKey) return sendJSON(res, 400, { code: 400, message: '缺少接口地址或 API Key' });
+  try {
+    const reply = await callLLM(baseUrl, apiKey, model, [
+      { role: 'user', content: '请只回复「ok」两个字。' },
+    ], { temperature: 0, maxTokens: 10, timeoutMs: 20000 });
+    return sendJSON(res, 200, { code: 0, message: '连接成功', data: { reply: String(reply || '').slice(0, 20) } });
+  } catch (e) {
+    console.error('test settings error:', e.message);
+    return sendJSON(res, 502, { code: 502, message: '连接失败：' + e.message });
+  }
+}
+
+// ==================== AI 陪玩存档（保存进度 / 继续游玩） ====================
+// 每用户每汤一份存档（覆盖式 upsert），保存聊天记录、推理进度、用时、剩余次数
+async function handleAISave(req, res) {
+  if (!pool) return dbNotReady(res);
+  const payload = safeJSON(bodyToText(await readBody(req)));
+  if (payload === null) return sendJSON(res, 400, { code: 400, message: '请求格式错误' });
+
+  const soupId = (payload.soupId || '').trim();
+  const face = (payload.face || '');
+  const bottom = (payload.bottom || '');
+  if (!soupId) return sendJSON(res, 400, { code: 400, message: '缺少汤 ID' });
+  if (!face || !bottom) return sendJSON(res, 400, { code: 400, message: '存档缺少汤面或汤底' });
+
+  const history = Array.isArray(payload.history) ? payload.history : [];
+  const row = {
+    id: crypto.randomUUID(),
+    user_id: req.authUser.uid,
+    soup_id: soupId,
+    soup_title: String(payload.soupTitle || '未命名海龟汤').slice(0, 200),
+    face,
+    bottom,
+    type: ['清汤', '红汤'].includes(payload.type) ? payload.type : '清汤',
+    style: ['本格', '变格'].includes(payload.style) ? payload.style : '本格',
+    diff_key: String(payload.diffKey || 'easy').slice(0, 20),
+    diff_label: String(payload.diffLabel || '简单').slice(0, 20),
+    total_questions: Number(payload.totalQuestions) || 0,
+    remaining_questions: Number(payload.remainingQuestions) || 0,
+    remaining_seconds: Math.max(0, Number(payload.remainingSeconds) || 0),
+    elapsed_seconds: Math.max(0, Number(payload.elapsedSeconds) || 0),
+    last_progress: Math.min(100, Math.max(0, Number(payload.lastProgress) || 0)),
+    history_json: JSON.stringify(history).slice(0, 4 * 1024 * 1024), // 上限 4MB
+  };
+
+  try {
+    await pool.query(
+      `INSERT INTO game_saves
+        (id, user_id, soup_id, soup_title, face, bottom, type, style, diff_key, diff_label,
+         total_questions, remaining_questions, remaining_seconds, elapsed_seconds, last_progress, history_json)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE
+         soup_title = VALUES(soup_title), face = VALUES(face), bottom = VALUES(bottom),
+         type = VALUES(type), style = VALUES(style), diff_key = VALUES(diff_key),
+         diff_label = VALUES(diff_label), total_questions = VALUES(total_questions),
+         remaining_questions = VALUES(remaining_questions), remaining_seconds = VALUES(remaining_seconds),
+         elapsed_seconds = VALUES(elapsed_seconds), last_progress = VALUES(last_progress),
+         history_json = VALUES(history_json)`,
+      [row.id, row.user_id, row.soup_id, row.soup_title, row.face, row.bottom, row.type, row.style,
+       row.diff_key, row.diff_label, row.total_questions, row.remaining_questions,
+       row.remaining_seconds, row.elapsed_seconds, row.last_progress, row.history_json]
+    );
+    return sendJSON(res, 200, { code: 0, message: '进度已保存', data: { soupId } });
+  } catch (e) {
+    console.error('ai save error:', e);
+    return sendJSON(res, 500, { code: 500, message: '保存失败，请稍后重试' });
+  }
+}
+
+// 当前用户全部存档列表（用于选汤页显示「继续游玩」按钮）
+async function handleAIListSaves(req, res) {
+  if (!pool) return dbNotReady(res);
+  try {
+    const [rows] = await pool.query(
+      `SELECT soup_id, last_progress, remaining_questions, updated_at
+       FROM game_saves WHERE user_id = ?`,
+      [req.authUser.uid]
+    );
+    const list = rows.map((r) => ({
+      soupId: r.soup_id,
+      lastProgress: r.last_progress,
+      remainingQuestions: r.remaining_questions,
+      updatedAt: r.updated_at,
+    }));
+    return sendJSON(res, 200, { code: 0, data: { list } });
+  } catch (e) {
+    console.error('ai saves list error:', e);
+    return sendJSON(res, 500, { code: 500, message: '查询存档失败' });
+  }
+}
+
+// 读取某汤的存档详情（恢复游戏现场）
+async function handleAIGetSave(req, res, soupId) {
+  if (!pool) return dbNotReady(res);
+  try {
+    const [rows] = await pool.query(
+      `SELECT soup_id, soup_title, face, bottom, type, style, diff_key, diff_label,
+              total_questions, remaining_questions, remaining_seconds, elapsed_seconds,
+              last_progress, history_json
+       FROM game_saves WHERE user_id = ? AND soup_id = ?`,
+      [req.authUser.uid, soupId]
+    );
+    const s = rows[0];
+    if (!s) return sendJSON(res, 404, { code: 404, message: '该汤没有保存的进度' });
+    let history = [];
+    try { history = JSON.parse(s.history_json || '[]'); } catch (e) { history = []; }
+    return sendJSON(res, 200, {
+      code: 0,
+      data: {
+        soupId: s.soup_id,
+        soupTitle: s.soup_title,
+        face: s.face,
+        bottom: s.bottom,
+        type: s.type,
+        style: s.style,
+        diffKey: s.diff_key,
+        diffLabel: s.diff_label,
+        totalQuestions: s.total_questions,
+        remainingQuestions: s.remaining_questions,
+        remainingSeconds: s.remaining_seconds,
+        elapsedSeconds: s.elapsed_seconds,
+        lastProgress: s.last_progress,
+        history: Array.isArray(history) ? history : [],
+      },
+    });
+  } catch (e) {
+    console.error('ai get save error:', e);
+    return sendJSON(res, 500, { code: 500, message: '读取存档失败' });
+  }
+}
+
+// 福尔摩斯难度：让 AI 在不影响故事真实的前提下酌情删减汤面文字
+async function handleAIShorten(req, res) {  const payload = safeJSON(bodyToText(await readBody(req)));
+  if (payload === null) return sendJSON(res, 400, { code: 400, message: '请求格式错误' });
+
+  const face = payload.face;
+  if (!face) return sendJSON(res, 400, { code: 400, message: '缺少汤面' });
+
+  // 读取服务端引擎设置（删减汤面依赖大模型；未配置则降级返回原汤面）
+  let llmCfg = null;
+  try {
+    const [rows] = await pool.query(
+      'SELECT llm_enabled, llm_base_url, llm_model, llm_api_key FROM user_settings WHERE user_id = ?',
+      [req.authUser.uid]
+    );
+    const s = rows[0];
+    if (s && s.llm_enabled && s.llm_base_url && s.llm_api_key) {
+      llmCfg = { baseUrl: s.llm_base_url, apiKey: s.llm_api_key, model: s.llm_model || '' };
+    }
+  } catch (e) {
+    console.error('read user_settings (shorten) error:', e.message);
+  }
+  if (!llmCfg) {
+    // 未配大模型：降级返回原汤面，不报错
+    return sendJSON(res, 200, { code: 0, data: { face, degraded: true } });
+  }
+
+  try {
+    const messages = [
+      {
+        role: 'system',
+        content: '你是一个海龟汤游戏的出题助手。下面给出一段海龟汤的「汤面」（事件摘要）。请在不改变故事事实、不影响玩家推理的前提下，酌情删减掉一些文字（保留关键事实，删去冗余描述），让汤面更简短、更有挑战性。直接输出删减后的汤面文字，不要任何解释、不要代码块。',
+      },
+      { role: 'user', content: face },
+    ];
+    const shortened = await callLLM(llmCfg.baseUrl, llmCfg.apiKey, llmCfg.model, messages);
+    return sendJSON(res, 200, { code: 0, data: { face: shortened || face } });
+  } catch (e) {
+    console.error('ai shorten error:', e.message);
+    // 删减失败降级返回原汤面
+    return sendJSON(res, 200, { code: 0, data: { face, degraded: true } });
+  }
+}
+
+// ==================== 启动 ====================
+(async function start() {
+  try {
+    await initDatabase();
+  } catch (e) {
+    console.error('❌ 数据库初始化失败:', e.code, e.message);
+    console.error('   请检查 MySQL 是否已启动，以及连接配置是否正确（DB_HOST/DB_PORT/DB_USER/DB_PASSWORD/DB_NAME）');
+    // 数据库不可用时仍启动 HTTP 服务，接口会返回 503，方便排障
+  }
+  server.listen(PORT, () => {
+    console.log(`✅ 海龟汤网站后端已启动: http://localhost:${PORT}`);
+  });
+})();

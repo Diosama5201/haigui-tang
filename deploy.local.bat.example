@@ -1,0 +1,16 @@
+@echo off
+rem ============================================
+rem  本地部署配置 —— 示例文件（可提交到仓库）
+rem
+rem  使用方法：
+rem    1. 复制本文件为 deploy.local.bat
+rem    2. 把下面的 KEY 与 HOST 换成你自己的真实值
+rem
+rem  deploy.local.bat 已被 .gitignore 忽略，不会上传到仓库。
+rem ============================================
+
+rem SSH 私钥路径，建议用 %USERPROFILE% 开头
+set KEY=%USERPROFILE%\.ssh\your_key_name
+
+rem 服务器登录地址，格式：用户名@服务器IP
+set HOST=Administrator@your.server.ip

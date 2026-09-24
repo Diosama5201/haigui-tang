@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>海龟汤 · 登录</title>
+  <link rel="stylesheet" href="/css/style.css" />
+  <link rel="icon" href="/img/turtle.svg" type="image/svg+xml" />
+</head>
+<body class="auth-body">
+  <div class="auth-bg">
+    <div class="bubble b1"></div>
+    <div class="bubble b2"></div>
+    <div class="bubble b3"></div>
+    <div class="bubble b4"></div>
+  </div>
+
+  <div class="auth-card">
+    <div class="auth-logo">
+      <img src="/img/turtle.svg" alt="海龟汤" />
+      <h1>海龟汤</h1>
+      <p class="auth-sub">一碗汤 · 一场推理</p>
+    </div>
+
+    <!-- 登录表单 -->
+    <form id="loginForm" class="auth-form" novalidate>
+      <h2 class="auth-title">登录</h2>
+      <label class="field">
+        <span>用户名</span>
+        <input type="text" id="loginUsername" placeholder="请输入用户名" autocomplete="username" />
+      </label>
+      <label class="field">
+        <span>密码</span>
+        <input type="password" id="loginPassword" placeholder="请输入密码" autocomplete="current-password" />
+      </label>
+      <button type="submit" class="btn btn-primary btn-block" id="loginBtn">登 录</button>
+      <p class="auth-switch">
+        还没有账号？<a href="javascript:void(0)" id="toRegister">立即注册</a>
+      </p>
+    </form>
+
+    <!-- 注册表单 -->
+    <form id="registerForm" class="auth-form" style="display:none" novalidate>
+      <h2 class="auth-title">注册</h2>
+      <label class="field">
+        <span>用户名</span>
+        <input type="text" id="regUsername" placeholder="2~20 个字符" autocomplete="username" />
+      </label>
+      <label class="field">
+        <span>密码</span>
+        <input type="password" id="regPassword" placeholder="至少 4 位" autocomplete="new-password" />
+      </label>
+      <label class="field">
+        <span>确认密码</span>
+        <input type="password" id="regPassword2" placeholder="再次输入密码" autocomplete="new-password" />
+      </label>
+      <button type="submit" class="btn btn-primary btn-block" id="regBtn">注 册</button>
+      <p class="auth-switch">
+        已有账号？<a href="javascript:void(0)" id="toLogin">返回登录</a>
+      </p>
+    </form>
+  </div>
+
+  <script src="/js/api.js"></script>
+  <script src="/js/auth.js"></script>
+</body>
+</html>
