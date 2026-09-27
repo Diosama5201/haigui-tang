@@ -8,7 +8,8 @@
     "test": "node tests/offline-engine.test.js && node tests/annotation-store.test.js",
     "test:engine": "node tests/offline-engine.test.js",
     "test:annotations": "node tests/annotation-store.test.js",
-    "eval:annotations": "node tests/annotations.run.js"
+    "eval:annotations": "node tests/annotations.run.js",
+    "import:puzzles": "node tools/import-puzzles.js"
   },
   "license": "MIT",
   "dependencies": {

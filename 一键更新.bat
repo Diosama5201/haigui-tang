@@ -57,7 +57,7 @@ echo.
 echo [1/4] Uploading backend (server.js, vector-store.js, progress-utils.js, offline-engine.js, annotation-store.js, package.json) ...
 "%SCPEXE%" %SSHOPT% "server.js" "vector-store.js" "progress-utils.js" "offline-engine.js" "annotation-store.js" "package.json" "package-lock.json" "%HOST%:C:/haigui/"
 if errorlevel 1 goto fail
-"%SCPEXE%" %SSHOPT% -r "annotations" "%HOST%:C:/haigui/"
+"%SCPEXE%" %SSHOPT% -r "annotations" "seed" "tools" "%HOST%:C:/haigui/"
 if errorlevel 1 goto fail
 
 echo.
