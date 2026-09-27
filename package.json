@@ -5,7 +5,10 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test": "node tests/offline-engine.test.js"
+    "test": "node tests/offline-engine.test.js && node tests/annotation-store.test.js",
+    "test:engine": "node tests/offline-engine.test.js",
+    "test:annotations": "node tests/annotation-store.test.js",
+    "eval:annotations": "node tests/annotations.run.js"
   },
   "license": "MIT",
   "dependencies": {
