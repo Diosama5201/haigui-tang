@@ -57,6 +57,41 @@ const DB_CONFIG = {
 const UPLOAD_DIR = path.join(__dirname, 'data', 'uploads');
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
+// 汤封面图目录（文件名为随机 UUID，URL 不可枚举）
+const COVER_DIR = path.join(__dirname, 'data', 'uploads', 'covers');
+if (!fs.existsSync(COVER_DIR)) fs.mkdirSync(COVER_DIR, { recursive: true });
+
+// 允许的封面文件名格式（服务端生成的 uuid.ext，杜绝路径拼接注入）
+const COVER_FILE_RE = /^[\w-]+\.(jpg|jpeg|png|webp)$/i;
+
+// 封面图片魔数校验：不信任扩展名，只认文件头
+function detectImageExt(buf) {
+  if (!buf || buf.length < 12) return null;
+  // JPEG: FF D8 FF
+  if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return 'jpg';
+  // PNG: 89 50 4E 47 0D 0A 1A 0A
+  if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) return 'png';
+  // WEBP: 'RIFF' .... 'WEBP'
+  if (buf.slice(0, 4).toString('ascii') === 'RIFF' && buf.slice(8, 12).toString('ascii') === 'WEBP') return 'webp';
+  return null;
+}
+
+// 删除封面文件（存在才删，异常不中断主流程）
+function removeCoverFile(file) {
+  if (!file || !COVER_FILE_RE.test(file)) return;
+  try {
+    const p = path.join(COVER_DIR, file);
+    if (fs.existsSync(p)) fs.unlinkSync(p);
+  } catch (e) {
+    console.error('remove cover file error:', e.message);
+  }
+}
+
+// 由库内文件名拼出对外访问地址
+function coverUrlOf(file) {
+  return file ? '/covers/' + file : '';
+}
+
 // ==================== 密码加密（加盐 SHA256） ====================
 function hashPassword(password, salt) {
   return crypto.createHash('sha256').update(salt + ':' + password).digest('hex');
@@ -148,11 +183,19 @@ async function initDatabase() {
       difficulty  TINYINT      NOT NULL DEFAULT 1,
       author_id   VARCHAR(36)  NOT NULL,
       author_name VARCHAR(50)  NOT NULL,
+      cover_file  VARCHAR(100) NOT NULL DEFAULT '',
       created_at  DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
       INDEX idx_created (created_at),
       INDEX idx_author (author_id)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
   `);
+
+  // 存量表迁移：补 cover_file 列（已存在时忽略重复列错误 ER_DUP_FIELDNAME）
+  try {
+    await pool.query(`ALTER TABLE soups ADD COLUMN cover_file VARCHAR(100) NOT NULL DEFAULT ''`);
+  } catch (e) {
+    if (e && e.code !== 'ER_DUP_FIELDNAME') throw e;
+  }
 
   // AI 陪玩存档：每用户每汤一份（覆盖式），保存后可继续游玩
   await pool.query(`
@@ -321,6 +364,18 @@ const server = http.createServer(async (req, res) => {
       }
     }
 
+    // 封面图上传（需登录；先传图拿文件名，创建/保存汤时再绑定）
+    if (method === 'POST' && pathname === '/api/soup-cover') {
+      const user = getAuthUser(req);
+      if (!user) return sendJSON(res, 401, { code: 401, message: '未登录，请先登录' });
+      return await handleCoverUpload(req, res);
+    }
+
+    // 封面图读取（公开：文件名为随机 UUID，不可枚举，等同于静态资源）
+    if (method === 'GET' && pathname.startsWith('/covers/')) {
+      return serveCover(res, pathname);
+    }
+
     // 上传文件接口（需登录）
     if (method === 'POST' && pathname === '/api/upload') {
       const user = getAuthUser(req);
@@ -451,7 +506,7 @@ async function handleListSoups(req, res, url) {
       : null;
 
     const selectFields =
-      'SELECT id, title, type, style, difficulty, author_id, author_name, created_at FROM soups';
+      'SELECT id, title, face, type, style, difficulty, author_id, author_name, cover_file, created_at FROM soups';
     const orderClause = ' ORDER BY created_at DESC, id DESC';
 
     let rows;
@@ -476,11 +531,13 @@ async function handleListSoups(req, res, url) {
     const list = rows.map((r) => ({
       id: r.id,
       title: r.title,
+      face: r.face,
       type: r.type,
       style: r.style,
       difficulty: r.difficulty,
       authorId: r.author_id,
       author: r.author_name,
+      coverUrl: coverUrlOf(r.cover_file),
       createdAt: r.created_at,
     }));
     return sendJSON(res, 200, {
@@ -516,12 +573,24 @@ async function handleCreateSoup(req, res) {
   if (!['本格', '变格'].includes(style)) return sendJSON(res, 400, { code: 400, message: '风格不正确' });
   if (difficulty < 1 || difficulty > 5) return sendJSON(res, 400, { code: 400, message: '难度需在 1~5 星之间' });
 
+  // 封面绑定（可选）：必须是由 /api/soup-cover 上传生成的合法文件名，且文件真实存在
+  let coverFile = '';
+  if (payload.coverFile) {
+    if (typeof payload.coverFile !== 'string' || !COVER_FILE_RE.test(payload.coverFile)) {
+      return sendJSON(res, 400, { code: 400, message: '封面文件无效，请重新上传' });
+    }
+    if (!fs.existsSync(path.join(COVER_DIR, payload.coverFile))) {
+      return sendJSON(res, 400, { code: 400, message: '封面文件不存在，请重新上传' });
+    }
+    coverFile = payload.coverFile;
+  }
+
   const id = crypto.randomUUID();
   try {
     await pool.query(
-      `INSERT INTO soups (id, title, face, bottom, type, style, difficulty, author_id, author_name)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [id, title, face, bottom, type, style, difficulty, req.authUser.uid, req.authUser.username]
+      `INSERT INTO soups (id, title, face, bottom, type, style, difficulty, author_id, author_name, cover_file)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [id, title, face, bottom, type, style, difficulty, req.authUser.uid, req.authUser.username, coverFile]
     );
     // 汤入库的同时自动入向量库
     ingestSoupContent({ soupId: id, title, face, bottom, source: 'soup' });
@@ -536,7 +605,7 @@ async function handleGetSoup(req, res, id) {
   if (!pool) return dbNotReady(res);
   try {
     const [rows] = await pool.query(
-      `SELECT id, title, face, bottom, type, style, difficulty, author_id, author_name, created_at
+      `SELECT id, title, face, bottom, type, style, difficulty, author_id, author_name, cover_file, created_at
        FROM soups WHERE id = ?`,
       [id]
     );
@@ -554,6 +623,7 @@ async function handleGetSoup(req, res, id) {
         difficulty: s.difficulty,
         authorId: s.author_id,
         author: s.author_name,
+        coverUrl: coverUrlOf(s.cover_file),
         createdAt: s.created_at,
       },
     });
@@ -573,6 +643,8 @@ async function handleDeleteSoup(req, res, id) {
       return sendJSON(res, 403, { code: 403, message: '只能删除自己添加的海龟汤' });
     }
     await pool.query('DELETE FROM soups WHERE id = ?', [id]);
+    // 顺手清理封面文件（删除失败不影响主流程）
+    removeCoverFile(rows[0].cover_file);
     return sendJSON(res, 200, { code: 0, message: '删除成功' });
   } catch (e) {
     console.error('delete error:', e);
@@ -600,17 +672,35 @@ async function handleUpdateSoup(req, res, id) {
   if (difficulty < 1 || difficulty > 5) return sendJSON(res, 400, { code: 400, message: '难度需在 1~5 星之间' });
 
   try {
-    const [rows] = await pool.query('SELECT author_id FROM soups WHERE id = ?', [id]);
+    const [rows] = await pool.query('SELECT author_id, cover_file FROM soups WHERE id = ?', [id]);
     if (rows.length === 0) return sendJSON(res, 404, { code: 404, message: '未找到该海龟汤' });
     // 仅创建者本人可修改
     if (rows[0].author_id !== req.authUser.uid) {
       return sendJSON(res, 403, { code: 403, message: '只能修改自己添加的海龟汤' });
     }
+
+    // 封面变更：换图 / 移除时清理旧文件，新文件名必须合法且真实存在
+    const oldCover = rows[0].cover_file || '';
+    let coverFile = oldCover;
+    if (payload.coverClear === true) {
+      coverFile = '';
+    } else if (typeof payload.coverFile === 'string' && payload.coverFile && payload.coverFile !== oldCover) {
+      if (!COVER_FILE_RE.test(payload.coverFile)) {
+        return sendJSON(res, 400, { code: 400, message: '封面文件无效，请重新上传' });
+      }
+      if (!fs.existsSync(path.join(COVER_DIR, payload.coverFile))) {
+        return sendJSON(res, 400, { code: 400, message: '封面文件不存在，请重新上传' });
+      }
+      coverFile = payload.coverFile;
+    }
+
     await pool.query(
-      `UPDATE soups SET title = ?, face = ?, bottom = ?, type = ?, style = ?, difficulty = ?
+      `UPDATE soups SET title = ?, face = ?, bottom = ?, type = ?, style = ?, difficulty = ?, cover_file = ?
        WHERE id = ?`,
-      [title, face, bottom, type, style, difficulty, id]
+      [title, face, bottom, type, style, difficulty, coverFile, id]
     );
+    // 封面换了才删旧文件（内容未变时不重复清理）
+    if (coverFile !== oldCover) removeCoverFile(oldCover);
     // 汤内容变更：先清掉旧向量再重新入库
     chroma.deleteWhere(VECTOR_COLLECTION, (meta) => meta && meta.soupId === id);
     ingestSoupContent({ soupId: id, title, face, bottom, source: 'soup' });
@@ -679,6 +769,42 @@ async function handleUpload(req, res) {
   return sendJSON(res, 200, { code: 0, message: '上传成功，已解析', data: { title, face, bottom, filename } });
 }
 
+// ==================== 封面图上传（原始字节流，魔数校验） ====================
+async function handleCoverUpload(req, res) {
+  try {
+    const buf = await readBody(req); // 上限 10MB，由 readBody 兜底
+    if (!buf || buf.length === 0) return sendJSON(res, 400, { code: 400, message: '未检测到图片内容' });
+    if (buf.length > 5 * 1024 * 1024) return sendJSON(res, 413, { code: 413, message: '封面图片不能超过 5MB' });
+
+    const ext = detectImageExt(buf);
+    if (!ext) return sendJSON(res, 400, { code: 400, message: '仅支持 jpg / png / webp 格式的图片' });
+
+    const file = `${crypto.randomUUID()}.${ext}`;
+    fs.writeFileSync(path.join(COVER_DIR, file), buf);
+    return sendJSON(res, 200, { code: 0, message: '封面上传成功', data: { file, url: coverUrlOf(file) } });
+  } catch (e) {
+    console.error('cover upload error:', e);
+    return sendJSON(res, 500, { code: 500, message: '封面上传失败，请稍后重试' });
+  }
+}
+
+// ==================== 封面图读取（公开，文件名随机不可枚举） ====================
+function serveCover(res, pathname) {
+  const file = decodeURIComponent(pathname.slice('/covers/'.length));
+  if (!COVER_FILE_RE.test(file)) return sendJSON(res, 400, { code: 400, message: '非法的封面地址' });
+  const fullPath = path.join(COVER_DIR, file);
+  if (!fullPath.startsWith(COVER_DIR)) return sendJSON(res, 403, { code: 403, message: '禁止访问' });
+  fs.readFile(fullPath, (err, data) => {
+    if (err) return sendJSON(res, 404, { code: 404, message: '封面不存在' });
+    const ext = path.extname(file).toLowerCase();
+    res.writeHead(200, {
+      'Content-Type': MIME[ext] || 'application/octet-stream',
+      'Cache-Control': 'public, max-age=31536000, immutable', // 文件名唯一，可永久缓存
+    });
+    res.end(data);
+  });
+}
+
 // ==================== 工具：安全 JSON 解析 ====================
 function safeJSON(str) {
   try {
@@ -698,6 +824,7 @@ const MIME = {
   '.jpg': 'image/jpeg',
   '.jpeg': 'image/jpeg',
   '.gif': 'image/gif',
+  '.webp': 'image/webp',
   '.svg': 'image/svg+xml',
   '.ico': 'image/x-icon',
   '.txt': 'text/plain; charset=utf-8',
@@ -722,7 +849,11 @@ function serveStatic(req, res, pathname) {
       return;
     }
     const ext = path.extname(fullPath).toLowerCase();
-    res.writeHead(200, { 'Content-Type': MIME[ext] || 'application/octet-stream' });
+    res.writeHead(200, {
+      'Content-Type': MIME[ext] || 'application/octet-stream',
+      // 页面与前端脚本要求即时生效（改完刷新即见），不做启发式缓存
+      'Cache-Control': ['.html', '.css', '.js', '.json'].includes(ext) ? 'no-cache' : 'public, max-age=3600',
+    });
     res.end(data);
   });
 }
@@ -898,7 +1029,6 @@ async function handleAIAsk(req, res) {
   const { face, bottom, history } = payload;
   const soupId = payload.soupId || null; // 当前游玩的汤 id，用于检索时优先本汤内容
   const question = (payload.question || '').trim();
-
   if (!face || !bottom) {
     return sendJSON(res, 400, { code: 400, message: '缺少汤面或汤底' });
   }
@@ -941,10 +1071,28 @@ async function handleAIAsk(req, res) {
   } catch (e) { prevProgress = 0; }
   const fullHistory = (Array.isArray(history) ? history : []).concat([{ question, answer: '是' }]);
 
+  // —— 题目分类字段（style / type）：离线引擎回答「这是本格吗」「是红汤吗」时必须用到 ——
+  // 前端会带上；缺失时（旧存档 / 兼容前端）按 soupId 回查题库兜底
+  let soupMeta = {
+    style: payload.style || null,
+    type: payload.type || null,
+  };
+  if ((!soupMeta.style || !soupMeta.type) && soupId) {
+    try {
+      const [rows] = await pool.query('SELECT style, type FROM soups WHERE id = ? LIMIT 1', [soupId]);
+      if (rows[0]) {
+        soupMeta.style = soupMeta.style || rows[0].style;
+        soupMeta.type = soupMeta.type || rows[0].type;
+      }
+    } catch (e) {
+      console.error('read soup meta error:', e.message); // 读不到就靠文本推断兜底，不影响主流程
+    }
+  }
+
   // —— 路径 A：离线引擎（未配大模型，或大模型失败时回退到这里）——
   if (!llmCfg) {
     try {
-      const r = offlineEngine.offlineJudge(face, bottom, question, prevProgress);
+      const r = offlineEngine.offlineJudge(face, bottom, question, prevProgress, soupMeta);
       return sendJSON(res, 200, {
         code: 0,
         data: {
@@ -1061,7 +1209,7 @@ async function handleAIAsk(req, res) {
     // 大模型失败 → 回退离线引擎（不影响游戏）
     console.error('llm ask error, fallback to offline:', e.message);
     try {
-      const r = offlineEngine.offlineJudge(face, bottom, question, prevProgress);
+      const r = offlineEngine.offlineJudge(face, bottom, question, prevProgress, soupMeta);
       return sendJSON(res, 200, {
         code: 0,
         data: { answer: r.answer, progress: r.progress, engine: 'offline', agentProgress: null, raw: '', fallback: true },
