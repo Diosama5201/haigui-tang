@@ -11,6 +11,8 @@
  * 配了大模型的用户仍走大模型（handleAIAsk 中优先，失败回退本引擎）。
  */
 
+const { lookupAnnotation } = require('./annotation-store');
+
 // 中文停用词 + 无意义虚词（用于从汤底抽取关键实义词）
 const STOPWORDS = new Set(
   '的了是在和有着就被这那个中上下里外自己因为所以但是然而如果那么已经曾经正在不是没有大概或许应该可以可能也许然后于是因此之乎者也啊吧呢吗了啦'.split('')
@@ -682,11 +684,38 @@ function matchConcepts(bottom, question) {
  *   - 完全无重合 → 无关紧要，进度不变
  *   - 开放式提问 → 无关紧要
  */
-function offlineJudge(face, bottom, question, prevProgress, soupMeta) {
+function offlineJudge(face, bottom, question, prevProgress, soupMeta, opts) {
   const q = String(question || '').trim();
   const prev = Math.max(0, Math.min(100, Number(prevProgress) || 0));
 
   if (!q) return { answer: '无关紧要', progress: prev, reason: 'empty' };
+
+  // -1) 【人工标注标准答案表】纯查询层，不参与任何判定逻辑。
+  //     命中 → 直接返回人工确认过的答案；未命中 → 原样交给下面的规则引擎。
+  //     标注文件缺失 / 题目对不上 / 答案不在四档白名单内 → 一律静默跳过。
+  //     opts.annotations === false 时禁用（跑分器要测规则引擎真实水平，不能被标注层掩盖）。
+  if (!opts || opts.annotations !== false) {
+    try {
+      const hit = lookupAnnotation({
+        face,
+        bottom,
+        title: soupMeta && soupMeta.title,
+        question: q,
+      });
+      if (hit) {
+        return {
+          answer: hit.answer,
+          progress: Math.min(85, prev + (hit.answer === '无关紧要' ? 1 : 6)),
+          reason: 'annotation-hit',
+          matched: [],
+          annotation: { id: hit.id, layer: hit.layer, soupId: hit.soupId },
+        };
+      }
+    } catch (e) {
+      // 查表出错绝不能影响游戏，静默继续走规则引擎
+      console.error('annotation lookup error:', e.message);
+    }
+  }
 
   // 0) 元信息提问（本格/变格、清汤/红汤）：答案由题库字段决定，与汤底情节无关。
   //    必须放在 isOpenQuestion / bigram 匹配【之前】：
