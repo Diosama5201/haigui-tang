@@ -1,16 +1,33 @@
 @echo off
-chcp 65001 >nul
+setlocal
 cd /d "%~dp0"
 
-rem ============================================
-rem  服务器地址与 SSH 密钥路径不写在本文件里，
-rem  而是放在 deploy.local.bat 中（已被 .gitignore 忽略，不会上传仓库）。
-rem  首次使用：复制 deploy.local.bat.example 为 deploy.local.bat 并填写。
-rem ============================================
+rem ------------------------------------------------------------------
+rem  Tools are called by ABSOLUTE PATH on purpose.
+rem  A broken/misconfigured PATH must not be able to break deployment.
+rem ------------------------------------------------------------------
+set "SYS=%SystemRoot%\System32"
+set "SCPEXE=%SYS%\OpenSSH\scp.exe"
+set "SSHEXE=%SYS%\OpenSSH\ssh.exe"
+
+if not exist "%SCPEXE%" (
+  echo [ERROR] scp.exe not found at %SCPEXE%
+  echo         Windows "OpenSSH Client" feature may be missing.
+  echo         Fix: Settings ^> Apps ^> Optional features ^> Add ^> OpenSSH Client
+  echo.
+  pause
+  exit /b 1
+)
+
+rem ------------------------------------------------------------------
+rem  Server address and SSH key path live in deploy.local.bat
+rem  (gitignored, never uploaded to the repository).
+rem  First time: copy deploy.local.bat.example to deploy.local.bat and fill it in.
+rem ------------------------------------------------------------------
 if not exist "deploy.local.bat" (
-  echo [ERROR] 找不到 deploy.local.bat
-  echo         请复制 deploy.local.bat.example 为 deploy.local.bat，
-  echo         填入你的 KEY 与 HOST 后重新运行本脚本。
+  echo [ERROR] deploy.local.bat not found.
+  echo         Copy deploy.local.bat.example to deploy.local.bat,
+  echo         fill in KEY and HOST, then run this script again.
   echo.
   pause
   exit /b 1
@@ -18,13 +35,13 @@ if not exist "deploy.local.bat" (
 call "deploy.local.bat"
 
 if "%KEY%"=="" (
-  echo [ERROR] deploy.local.bat 中未设置 KEY
+  echo [ERROR] KEY is not set in deploy.local.bat
   echo.
   pause
   exit /b 1
 )
 if "%HOST%"=="" (
-  echo [ERROR] deploy.local.bat 中未设置 HOST
+  echo [ERROR] HOST is not set in deploy.local.bat
   echo.
   pause
   exit /b 1
@@ -38,23 +55,23 @@ echo ============================================
 echo.
 
 echo [1/4] Uploading backend (server.js, vector-store.js, progress-utils.js, offline-engine.js, package.json) ...
-scp %SSHOPT% "server.js" "vector-store.js" "progress-utils.js" "offline-engine.js" "package.json" "package-lock.json" "%HOST%:C:/haigui/"
+"%SCPEXE%" %SSHOPT% "server.js" "vector-store.js" "progress-utils.js" "offline-engine.js" "package.json" "package-lock.json" "%HOST%:C:/haigui/"
 if errorlevel 1 goto fail
 
 echo.
 echo [2/4] Uploading frontend (public/) ...
-ssh %SSHOPT% "%HOST%" "rmdir /s /q C:\haigui\public" >nul 2>&1
-scp %SSHOPT% -r "public" "%HOST%:C:/haigui/"
+"%SSHEXE%" %SSHOPT% "%HOST%" "rmdir /s /q C:\haigui\public" >nul 2>&1
+"%SCPEXE%" %SSHOPT% -r "public" "%HOST%:C:/haigui/"
 if errorlevel 1 goto fail
 
 echo.
 echo [3/4] Installing dependencies on server ...
-ssh %SSHOPT% "%HOST%" "cd /d C:\haigui && npm install --omit=dev --no-audit --no-fund"
+"%SSHEXE%" %SSHOPT% "%HOST%" "cd /d C:\haigui && npm install --omit=dev --no-audit --no-fund"
 if errorlevel 1 goto fail
 
 echo.
 echo [4/4] Restarting website ...
-ssh %SSHOPT% "%HOST%" "pm2 restart haigui"
+"%SSHEXE%" %SSHOPT% "%HOST%" "pm2 restart haigui"
 
 echo.
 echo ============================================
