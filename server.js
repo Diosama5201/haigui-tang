@@ -184,15 +184,24 @@ async function initDatabase() {
       author_id   VARCHAR(36)  NOT NULL,
       author_name VARCHAR(50)  NOT NULL,
       cover_file  VARCHAR(100) NOT NULL DEFAULT '',
+      is_hidden   TINYINT      NOT NULL DEFAULT 0,
       created_at  DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
       INDEX idx_created (created_at),
-      INDEX idx_author (author_id)
+      INDEX idx_author (author_id),
+      INDEX idx_hidden (is_hidden)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
   `);
 
   // 存量表迁移：补 cover_file 列（已存在时忽略重复列错误 ER_DUP_FIELDNAME）
   try {
     await pool.query(`ALTER TABLE soups ADD COLUMN cover_file VARCHAR(100) NOT NULL DEFAULT ''`);
+  } catch (e) {
+    if (e && e.code !== 'ER_DUP_FIELDNAME') throw e;
+  }
+
+  // 存量表迁移：补 is_hidden 列（题库仅入库不上架时置 1，列表接口一律过滤）
+  try {
+    await pool.query(`ALTER TABLE soups ADD COLUMN is_hidden TINYINT NOT NULL DEFAULT 0`);
   } catch (e) {
     if (e && e.code !== 'ER_DUP_FIELDNAME') throw e;
   }
@@ -505,15 +514,18 @@ async function handleListSoups(req, res, url) {
       ? Math.min(50, Math.max(1, parseInt(qs.get('pageSize'), 10) || 10))
       : null;
 
+    // 隐藏题（is_hidden = 1，例如批量导入的储备题库）不进任何列表。
+    // 汤库页与 AI 选汤页共用本接口（带 pageSize = 汤库分页，不带 = AI 选汤全量），
+    // 所以在这里过滤一处，两个页面都不会展示隐藏题。
     const selectFields =
-      'SELECT id, title, face, type, style, difficulty, author_id, author_name, cover_file, created_at FROM soups';
+      'SELECT id, title, face, type, style, difficulty, author_id, author_name, cover_file, created_at FROM soups WHERE is_hidden = 0';
     const orderClause = ' ORDER BY created_at DESC, id DESC';
 
     let rows;
     let total = 0;
     let totalPages = 1;
     if (hasPaging) {
-      const [countRows] = await pool.query('SELECT COUNT(*) AS c FROM soups');
+      const [countRows] = await pool.query('SELECT COUNT(*) AS c FROM soups WHERE is_hidden = 0');
       total = Number(countRows[0].c) || 0;
       totalPages = Math.max(1, Math.ceil(total / pageSize));
       page = Math.min(page, totalPages);
@@ -605,12 +617,16 @@ async function handleGetSoup(req, res, id) {
   if (!pool) return dbNotReady(res);
   try {
     const [rows] = await pool.query(
-      `SELECT id, title, face, bottom, type, style, difficulty, author_id, author_name, cover_file, created_at
+      `SELECT id, title, face, bottom, type, style, difficulty, author_id, author_name, cover_file, is_hidden, created_at
        FROM soups WHERE id = ?`,
       [id]
     );
     const s = rows[0];
     if (!s) return sendJSON(res, 404, { code: 404, message: '未找到该海龟汤' });
+    // 隐藏题只对作者本人可见：列表已过滤，这里再挡一道，防止有人直接拼 id 访问未上架的题
+    if (Number(s.is_hidden) === 1 && s.author_id !== (req.authUser && req.authUser.uid)) {
+      return sendJSON(res, 404, { code: 404, message: '未找到该海龟汤' });
+    }
     return sendJSON(res, 200, {
       code: 0,
       data: {
