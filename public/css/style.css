@@ -44,7 +44,7 @@ body {
 }
 
 /* ---------- 小海龟光标（悬停反馈） ---------- */
-body, a, button, input, textarea, select, .nav-item, .soup-row, .soup-card,
+body, a, button, input, textarea, select, .nav-item, .soup-card,
 .modal, .auth-card, .box-input, .upload-btn, .star, .modal-close {
   cursor: url("/img/turtle-cursor.svg") 6 6, auto;
 }
@@ -334,91 +334,8 @@ body, a, button, input, textarea, select, .nav-item, .soup-row, .soup-card,
 /* =========================================================
    海龟汤库
    ========================================================= */
-.soup-list {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-}
-
-.soup-row {
-  position: relative;
-  display: flex;
-  align-items: center;
-  gap: 16px;
-  min-height: 150px;
-  background: var(--card);
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  padding: 22px 24px;
-  box-shadow: var(--shadow);
-  overflow: hidden;
-  transition: transform .35s cubic-bezier(.4, 0, .2, 1), box-shadow .35s ease, border-color .35s ease;
-}
-
-/* 背景图层：贴近标题的暗色氛围插画，悬浮时向屏幕拉近（放大） */
-.soup-row-bg {
-  position: absolute;
-  inset: 0;
-  background-size: cover;
-  background-position: center;
-  transform: scale(1.08);
-  transition: transform .55s cubic-bezier(.4, 0, .2, 1);
-  will-change: transform;
-}
-.soup-row:hover .soup-row-bg {
-  transform: scale(1.16);
-}
-
-/* 暗色渐变遮罩：保证文字在白/亮背景图上依然清晰可读 */
-.soup-row-scrim {
-  position: absolute;
-  inset: 0;
-  background: linear-gradient(90deg, rgba(13, 20, 33, .88) 0%, rgba(13, 20, 33, .62) 45%, rgba(13, 20, 33, .28) 100%);
-  pointer-events: none;
-}
-
-/* 内容层抬到遮罩之上 */
-.soup-index,
-.soup-main,
-.soup-actions {
-  position: relative;
-  z-index: 2;
-}
-
-.soup-row:hover {
-  transform: translateY(-4px);
-  box-shadow: var(--shadow-lg);
-  border-color: var(--green-300);
-}
-
-.soup-index {
-  width: 34px;
-  height: 34px;
-  border-radius: 50%;
-  background: rgba(255, 255, 255, .16);
-  color: #fff;
-  border: 1px solid rgba(255, 255, 255, .32);
-  backdrop-filter: blur(4px);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-weight: 700;
-  font-size: 14px;
-  flex-shrink: 0;
-}
-
-.soup-main { flex: 1; min-width: 0; }
-.soup-title {
-  font-size: 19px;
-  font-weight: 700;
-  color: #fff;
-  margin-bottom: 6px;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  text-shadow: 0 1px 8px rgba(0, 0, 0, .45);
-}
-.soup-tags { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+/* 注：AI 陪玩选汤页与汤库共用 .soup-list 网格与 .soup-card 卡片样式，
+   定义统一放在下方「汤库卡片」区，此处不再有选汤页专属样式 */
 
 .tag {
   display: inline-flex;
@@ -446,8 +363,6 @@ body, a, button, input, textarea, select, .nav-item, .soup-row, .soup-card,
   color: rgba(255, 255, 255, .78);
   text-shadow: 0 1px 6px rgba(0, 0, 0, .4);
 }
-
-.soup-actions { flex-shrink: 0; }
 
 .empty {
   text-align: center;

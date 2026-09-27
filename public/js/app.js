@@ -95,6 +95,40 @@
     ].join(', ');
   }
 
+  // ==================== 封面懒加载（汤库卡片 / AI 选汤行 共用） ====================
+  // 预加载成功才把图上墙，加载失败静默保留渐变兜底层，绝不出现破图。
+  // card 需带 data-cover 属性，bgSelector 指向内部封面图层。
+  function loadCardCover(card, bgSelector) {
+    const url = card.dataset.cover;
+    if (!url) return;
+    const bg = card.querySelector(bgSelector || '.soup-card-bg');
+    if (!bg) return;
+    const img = new Image();
+    img.onload = () => {
+      bg.style.backgroundImage = 'url("' + url + '")';
+    };
+    img.onerror = () => { /* 加载失败保留渐变兜底层 */ };
+    img.src = url;
+  }
+
+  // 给一批带 data-cover 的卡片挂 IntersectionObserver 懒加载（距视口 300px 才预载）
+  function observeCovers(scopeEl, itemSelector) {
+    const items = scopeEl.querySelectorAll(itemSelector + '[data-cover]');
+    if (!('IntersectionObserver' in window)) {
+      items.forEach((c) => loadCardCover(c));
+      return;
+    }
+    const io = new IntersectionObserver((entries) => {
+      entries.forEach((en) => {
+        if (en.isIntersecting) {
+          loadCardCover(en.target);
+          io.unobserve(en.target);
+        }
+      });
+    }, { rootMargin: '300px' });
+    items.forEach((c) => io.observe(c));
+  }
+
   // ==================== 封面图选择器（写故事 / 上传故事 / 修改 三表单共用） ====================
   // 选中图片后立即上传拿到文件名，提交表单时才绑定到汤上；clear 标记用于修改页移除封面
   let coverState = { token: '', url: '', clear: false, original: '' };
@@ -300,19 +334,7 @@
         if (pgWrap) pgWrap.innerHTML = '';
         return;
       }
-      // 逐卡懒加载封面：距视口 300px 才预载，失败静默回退渐变底
-      function loadCardCover(card) {
-        const url = card.dataset.cover;
-        if (!url) return;
-        const img = new Image();
-        img.onload = () => {
-          const bg = card.querySelector('.soup-card-bg');
-          if (bg) bg.style.backgroundImage = 'url("' + url + '")';
-        };
-        img.onerror = () => { /* 加载失败保留渐变兜底层 */ };
-        img.src = url;
-      }
-
+      // 逐卡懒加载封面（共用 observeCovers）
       listEl.innerHTML = list.map((s, i) => {
         const isMine = currentUser && s.authorId === currentUser.uid;
         // 仅自己添加的汤显示红色「修改」「删除」按钮
@@ -348,21 +370,8 @@
       `;
       }).join('');
 
-      // 封面懒加载（IntersectionObserver 不可见不加载，与对方站策略一致）
-      const cards = listEl.querySelectorAll('.soup-card[data-cover]');
-      if ('IntersectionObserver' in window) {
-        const io = new IntersectionObserver((entries) => {
-          entries.forEach((en) => {
-            if (en.isIntersecting) {
-              loadCardCover(en.target);
-              io.unobserve(en.target);
-            }
-          });
-        }, { rootMargin: '300px' });
-        cards.forEach((c) => io.observe(c));
-      } else {
-        cards.forEach((c) => loadCardCover(c));
-      }
+      // 封面懒加载（距视口 300px 才预载，不可见不加载）
+      observeCovers(listEl, '.soup-card');
 
       listEl.querySelectorAll('[data-preview]').forEach((btn) => {
         btn.addEventListener('click', (e) => { e.stopPropagation(); openPreview(btn.dataset.preview); });
@@ -1165,23 +1174,39 @@
       } catch (e) {
         // 存档接口失败不影响选汤列表
       }
-      listEl.innerHTML = list.map((s, i) => `
-        <div class="soup-row">
-          <div class="soup-index">${i + 1}</div>
-          <div class="soup-main">
-            <div class="soup-title">${escapeHTML(s.title)}</div>
-            <div class="soup-tags">
-              ${typeTag(s.type)} ${styleTag(s.style)} ${starsHTML(s.difficulty)}
+      // 卡片结构与汤库 .soup-card 完全同款（同一套 CSS：等高网格、封面比例、
+      // 标题/简介排版、超长省略、hover 状态），差异只在操作按钮与点击行为
+      listEl.innerHTML = list.map((s, i) => {
+        const saved = saveMap[s.id];
+        return `
+        <div class="soup-card" data-id="${s.id}" data-cover="${escapeHTML(s.coverUrl || '')}" role="button" tabindex="0" aria-label="游玩 ${escapeHTML(s.title)}">
+          <div class="soup-card-fallback" style="background:${soupCoverStyle(s.title, s.type)}" aria-hidden="true"></div>
+          <div class="soup-card-bg" aria-hidden="true"></div>
+          <div class="soup-card-scrim" aria-hidden="true"></div>
+          <div class="soup-card-vignette" aria-hidden="true"></div>
+          <div class="soup-card-top">
+            <span class="soup-card-index">${i + 1}</span>
+            <span class="soup-card-stars">${starsHTML(s.difficulty)}</span>
+          </div>
+          <div class="soup-card-content">
+            <div class="soup-card-title">${escapeHTML(s.title)}</div>
+            <p class="soup-card-face">${escapeHTML(s.face || '')}</p>
+            <div class="soup-card-tags">
+              ${typeTag(s.type)}
+              ${styleTag(s.style)}
               <span class="soup-author">by ${escapeHTML(s.author || '匿名')}</span>
-              ${saveMap[s.id] ? `<span class="soup-author">· 已存进度 ${saveMap[s.id].lastProgress}%</span>` : ''}
+              ${saved ? `<span class="soup-author">· 已存进度 ${saved.lastProgress}%</span>` : ''}
+            </div>
+            <div class="soup-card-actions">
+              ${saved ? `<button class="btn btn-save" data-continue="${s.id}">继续游玩</button>` : ''}
+              <button class="btn btn-primary" data-play="${s.id}">游玩</button>
             </div>
           </div>
-          <div class="soup-actions">
-            ${saveMap[s.id] ? `<button class="btn btn-save" data-continue="${s.id}">继续游玩</button>` : ''}
-            <button class="btn btn-primary" data-play="${s.id}">游玩</button>
-          </div>
         </div>
-      `).join('');
+      `;
+      }).join('');
+      // 封面懒加载（与汤库一致：距视口 300px 才预载，无封面走渐变兜底）
+      observeCovers(listEl, '.soup-card');
       listEl.querySelectorAll('[data-play]').forEach((btn) => {
         btn.addEventListener('click', () => {
           goto('#/ai/play/' + btn.dataset.play);
@@ -1189,6 +1214,19 @@
       });
       listEl.querySelectorAll('[data-continue]').forEach((btn) => {
         btn.addEventListener('click', () => continueGame(btn.dataset.continue));
+      });
+      // 点卡片空白处 = 进入难度选择（与汤库「点卡片 = 预览」的交互一致）
+      listEl.querySelectorAll('.soup-card').forEach((card) => {
+        card.addEventListener('click', (e) => {
+          if (e.target.closest('button')) return;
+          goto('#/ai/play/' + card.dataset.id);
+        });
+        card.addEventListener('keydown', (e) => {
+          if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault();
+            goto('#/ai/play/' + card.dataset.id);
+          }
+        });
       });
     } catch (e) {
       document.getElementById('aiSoupList').innerHTML = `<div class="empty"><p>加载失败：${escapeHTML(e.message)}</p></div>`;
