@@ -4,7 +4,8 @@
   "description": "海龟汤（推理文字游戏）网站 —— MySQL 版",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "test": "node tests/offline-engine.test.js"
   },
   "license": "MIT",
   "dependencies": {
