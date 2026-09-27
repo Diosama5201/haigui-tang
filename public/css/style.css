@@ -44,7 +44,7 @@ body {
 }
 
 /* ---------- 小海龟光标（悬停反馈） ---------- */
-body, a, button, input, textarea, select, .nav-item, .soup-row,
+body, a, button, input, textarea, select, .nav-item, .soup-row, .soup-card,
 .modal, .auth-card, .box-input, .upload-btn, .star, .modal-close {
   cursor: url("/img/turtle-cursor.svg") 6 6, auto;
 }
@@ -341,18 +341,52 @@ body, a, button, input, textarea, select, .nav-item, .soup-row,
 }
 
 .soup-row {
+  position: relative;
   display: flex;
   align-items: center;
   gap: 16px;
+  min-height: 150px;
   background: var(--card);
   border: 1px solid var(--line);
   border-radius: var(--radius);
-  padding: 16px 20px;
+  padding: 22px 24px;
   box-shadow: var(--shadow);
-  transition: transform .15s, box-shadow .2s, border-color .2s;
+  overflow: hidden;
+  transition: transform .35s cubic-bezier(.4, 0, .2, 1), box-shadow .35s ease, border-color .35s ease;
 }
+
+/* 背景图层：贴近标题的暗色氛围插画，悬浮时向屏幕拉近（放大） */
+.soup-row-bg {
+  position: absolute;
+  inset: 0;
+  background-size: cover;
+  background-position: center;
+  transform: scale(1.08);
+  transition: transform .55s cubic-bezier(.4, 0, .2, 1);
+  will-change: transform;
+}
+.soup-row:hover .soup-row-bg {
+  transform: scale(1.16);
+}
+
+/* 暗色渐变遮罩：保证文字在白/亮背景图上依然清晰可读 */
+.soup-row-scrim {
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(90deg, rgba(13, 20, 33, .88) 0%, rgba(13, 20, 33, .62) 45%, rgba(13, 20, 33, .28) 100%);
+  pointer-events: none;
+}
+
+/* 内容层抬到遮罩之上 */
+.soup-index,
+.soup-main,
+.soup-actions {
+  position: relative;
+  z-index: 2;
+}
+
 .soup-row:hover {
-  transform: translateY(-2px);
+  transform: translateY(-4px);
   box-shadow: var(--shadow-lg);
   border-color: var(--green-300);
 }
@@ -361,8 +395,10 @@ body, a, button, input, textarea, select, .nav-item, .soup-row,
   width: 34px;
   height: 34px;
   border-radius: 50%;
-  background: var(--green-100);
-  color: var(--green-700);
+  background: rgba(255, 255, 255, .16);
+  color: #fff;
+  border: 1px solid rgba(255, 255, 255, .32);
+  backdrop-filter: blur(4px);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -373,13 +409,14 @@ body, a, button, input, textarea, select, .nav-item, .soup-row,
 
 .soup-main { flex: 1; min-width: 0; }
 .soup-title {
-  font-size: 17px;
+  font-size: 19px;
   font-weight: 700;
-  color: var(--ink);
-  margin-bottom: 4px;
+  color: #fff;
+  margin-bottom: 6px;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  text-shadow: 0 1px 8px rgba(0, 0, 0, .45);
 }
 .soup-tags { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 
@@ -406,7 +443,8 @@ body, a, button, input, textarea, select, .nav-item, .soup-row,
 
 .soup-author {
   font-size: 12px;
-  color: var(--ink-faint);
+  color: rgba(255, 255, 255, .78);
+  text-shadow: 0 1px 6px rgba(0, 0, 0, .4);
 }
 
 .soup-actions { flex-shrink: 0; }
@@ -1169,6 +1207,60 @@ html[data-theme='dark'] .switch.on {
   border-color: #23b385;
 }
 
+/* 当前生效引擎状态条：灰点=离线引擎，绿点(脉冲)=大模型主持 */
+.engine-status {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 10px 14px;
+  margin-bottom: 14px;
+  border: 1px solid var(--line);
+  border-left: 3px solid #9aa5a0;
+  border-radius: var(--radius);
+  background: var(--green-50);
+  font-size: 13.5px;
+  color: var(--ink-soft);
+}
+.engine-status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #9aa5a0;
+  flex-shrink: 0;
+}
+.engine-status.is-llm {
+  border-left-color: var(--green-500);
+  color: var(--ink);
+}
+.engine-status.is-llm .engine-status-dot {
+  background: var(--green-500);
+  animation: engine-pulse 1.8s ease-in-out infinite;
+}
+@keyframes engine-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(35, 179, 133, .55); }
+  50%      { box-shadow: 0 0 0 5px rgba(35, 179, 133, 0); }
+}
+
+/* 设置页底部行动区：保存后能直接去开玩，避免设置页成为死路 */
+.engine-cta {
+  margin-top: 20px;
+  padding-top: 18px;
+  border-top: 1px dashed var(--line);
+}
+.engine-cta-hint {
+  margin: 10px 0 0;
+  font-size: 13px;
+  color: var(--ink-soft);
+  text-align: center;
+}
+html[data-theme='dark'] .engine-status-dot,
+html[data-theme='dark'] .engine-status .engine-status-dot {
+  background: #6b7671;
+}
+html[data-theme='dark'] .engine-status.is-llm .engine-status-dot {
+  background: #23b385;
+}
+
 /* =========================================================
    昼夜主题（右上角 开灯/关灯 开关）
    ========================================================= */
@@ -1293,4 +1385,284 @@ html[data-theme='dark'] .progress-fill.lv-gray { background: #6b7480; }
   .game-page { height: calc(100vh - 76px); }
   .form-row, .dual-boxes { grid-template-columns: 1fr; }
   .dual-boxes { gap: 20px; }
+}
+
+/* =========================================================
+   题库网格卡片（沉浸式封面 + hover 拉近）
+   四层结构：渐变兜底层 / 封面图层(拉近) / 渐变遮罩 / 内容层
+   ========================================================= */
+.soup-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+  gap: 16px;
+}
+
+.btn-sm { padding: 6px 14px; font-size: 13px; border-radius: 8px; }
+
+.soup-card {
+  position: relative;
+  overflow: hidden;
+  border-radius: var(--radius);
+  min-height: 260px;
+  display: flex;
+  flex-direction: column;
+  background: var(--card);
+  border: 1px solid var(--line);
+  box-shadow: var(--shadow);
+  transition: transform .35s cubic-bezier(.4, 0, .2, 1), box-shadow .35s ease, border-color .35s ease;
+}
+.soup-card:hover,
+.soup-card:focus-visible {
+  transform: translateY(-4px);
+  box-shadow: var(--shadow-lg);
+  border-color: var(--green-300);
+  outline: none;
+}
+
+/* 渐变兜底层：无封面图时展示（按标题哈希生成的暗色氛围） */
+.soup-card-fallback {
+  position: absolute;
+  inset: 0;
+  background-size: cover;
+  background-position: center;
+}
+
+/* 封面图层：hover 拉近（放大 1.08），时长 550ms 形成景深 */
+.soup-card-bg {
+  position: absolute;
+  inset: 0;
+  background-size: cover;
+  background-position: center;
+  transform: scale(1);
+  transition: transform .55s cubic-bezier(.4, 0, .2, 1);
+  will-change: transform;
+}
+.soup-card:hover .soup-card-bg,
+.soup-card:focus-visible .soup-card-bg {
+  transform: scale(1.08);
+}
+
+/* 渐变遮罩：自下而上压暗保证白字可读；hover 微微提亮 */
+.soup-card-scrim {
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(to top, rgba(10, 16, 28, .92) 0%, rgba(10, 16, 28, .55) 48%, rgba(10, 16, 28, .22) 100%);
+  transition: opacity .3s ease;
+  pointer-events: none;
+}
+.soup-card:hover .soup-card-scrim { opacity: .85; }
+
+/* 内阴影：聚拢视线 */
+.soup-card-vignette {
+  position: absolute;
+  inset: 0;
+  box-shadow: inset 0 0 60px rgba(0, 0, 0, .4);
+  pointer-events: none;
+}
+
+.soup-card-top {
+  position: relative;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 14px 16px 0;
+}
+.soup-card-index {
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, .16);
+  border: 1px solid rgba(255, 255, 255, .32);
+  backdrop-filter: blur(4px);
+  color: #fff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 13px;
+  font-weight: 700;
+  flex-shrink: 0;
+}
+.soup-card-stars { text-shadow: 0 1px 4px rgba(0, 0, 0, .6); white-space: nowrap; }
+
+.soup-card-content {
+  position: relative;
+  z-index: 2;
+  margin-top: auto;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  color: #fff;
+}
+.soup-card-title {
+  font-size: 17px;
+  font-weight: 700;
+  color: #fff;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.soup-card-face {
+  font-size: 13px;
+  line-height: 1.6;
+  color: rgba(255, 255, 255, .82);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  min-height: 42px;
+}
+.soup-card-tags {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.soup-card-tags .soup-author { color: rgba(255, 255, 255, .6); }
+.soup-card-actions {
+  display: flex;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 2px;
+}
+
+/* 卡片内标签统一换半透明白底，保证在深色遮罩上可读 */
+.soup-card .tag {
+  background: rgba(255, 255, 255, .16);
+  color: #eaf2ff;
+  backdrop-filter: blur(2px);
+}
+.soup-card .star { color: #ffd66b; text-shadow: 0 1px 3px rgba(0,0,0,.55); }
+.soup-card .star.off { color: rgba(255, 255, 255, .35); text-shadow: none; }
+.soup-card .btn-ghost { color: rgba(255, 255, 255, .85); border-color: rgba(255, 255, 255, .35); }
+.soup-card .btn-ghost:hover { background: rgba(255, 255, 255, .16); color: #fff; }
+
+/* 窄屏：网格退化单列 */
+@media (max-width: 640px) {
+  .soup-list { grid-template-columns: 1fr; }
+}
+
+/* =========================================================
+   关灯恐怖模式（黑夜主题专属装饰）
+   - 背景换血红暗夜配色
+   - 顶部血迹缓慢滴落（纯 CSS 动画）
+   - 右下角写实骷髅（约页面面积 1/40：1920×1080 → ~196px 宽）
+   全部 pointer-events:none 且 z-index 低于主内容，不遮挡任何操作
+   ========================================================= */
+.app-shell { position: relative; z-index: 1; }
+
+.horror-layer {
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  overflow: hidden;
+  pointer-events: none;
+  display: none;
+}
+html[data-theme='dark'] .horror-layer { display: block; }
+
+/* ---------- 恐怖配色：血红暗夜 ---------- */
+html[data-theme='dark'] body,
+html[data-theme='dark'] .main {
+  background:
+    radial-gradient(1100px 540px at 88% -10%, rgba(122, 8, 8, .32), transparent 62%),
+    radial-gradient(900px 500px at -8% 112%, rgba(96, 4, 4, .26), transparent 58%),
+    radial-gradient(1500px 950px at 50% 45%, #140a0d 0%, #0b0507 58%, #070304 100%);
+}
+html[data-theme='dark'] .sidebar {
+  background: linear-gradient(180deg, #150b0e 0%, #0c0508 100%);
+}
+html[data-theme='dark'] .theme-toggle {
+  box-shadow: 0 0 18px rgba(210, 30, 30, .4);
+}
+html[data-theme='dark'] .theme-icon {
+  filter: drop-shadow(0 0 6px rgba(255, 80, 64, .9));
+}
+
+/* ---------- 顶部血迹渍（静态污痕） ---------- */
+.blood-drips { position: absolute; inset: 0; }
+.blood-drips::before {
+  content: '';
+  position: absolute;
+  top: 0; left: 0; right: 0;
+  height: 46px;
+  background:
+    radial-gradient(56px 26px at 7% 0%,  rgba(134, 10, 10, .45), transparent 74%),
+    radial-gradient(36px 18px at 13% 0%, rgba(134, 10, 10, .28), transparent 74%),
+    radial-gradient(62px 28px at 24% 0%, rgba(122, 8, 8, .4),    transparent 74%),
+    radial-gradient(34px 16px at 38% 0%, rgba(134, 10, 10, .26), transparent 74%),
+    radial-gradient(50px 24px at 53% 0%, rgba(122, 8, 8, .38),   transparent 74%),
+    radial-gradient(32px 15px at 65% 0%, rgba(134, 10, 10, .26), transparent 74%),
+    radial-gradient(64px 30px at 79% 0%, rgba(122, 8, 8, .42),   transparent 74%),
+    radial-gradient(38px 18px at 89% 0%, rgba(134, 10, 10, .3),  transparent 74%),
+    radial-gradient(48px 22px at 96% 0%, rgba(122, 8, 8, .36),   transparent 74%),
+    linear-gradient(180deg, rgba(104, 6, 6, .22), transparent);
+}
+
+/* ---------- 血滴：从顶部缓慢拉长垂落，末端带坠滴 ---------- */
+.drip {
+  display: block;
+  position: absolute;
+  top: 0;
+  left: var(--x);
+  width: var(--w);
+  height: 0;
+  background: linear-gradient(180deg,
+    rgba(96, 5, 5, 0) 0%,
+    #7d0606 14%,
+    #a60c0c 62%,
+    #c01313 92%,
+    #d21a1a 100%);
+  border-radius: 0 0 45% 45%;
+  opacity: 0;
+  filter: drop-shadow(0 0 5px rgba(170, 20, 20, .5));
+  animation: drip-fall var(--t) cubic-bezier(.4, 0, .6, 1) var(--d) infinite;
+}
+.drip::after {
+  content: '';
+  position: absolute;
+  bottom: calc(var(--w) * -1.15);
+  left: 50%;
+  transform: translateX(-50%);
+  width: calc(var(--w) * 2.4);
+  height: calc(var(--w) * 3);
+  background: radial-gradient(circle at 35% 28%, #d81c1c 0%, #a50c0c 55%, #680505 100%);
+  border-radius: 50% 50% 58% 58% / 42% 42% 60% 60%;
+  box-shadow: 0 3px 9px rgba(120, 0, 0, .6), 0 0 9px rgba(180, 26, 26, .38);
+}
+@keyframes drip-fall {
+  0%        { height: 0;         opacity: 0; }
+  6%        { height: 6px;       opacity: .9; }
+  68%       { height: var(--h);  opacity: .9; }
+  80%       { height: var(--h);  opacity: .55; }
+  92%, 100% { height: var(--h);  opacity: 0; }
+}
+
+/* ---------- 右下角写实骷髅 ---------- */
+.horror-skull {
+  position: absolute;
+  right: 12px;
+  bottom: 8px;
+  /* 380:512 图，宽 196px 时面积 ≈ 1920×1080 页面的 1/40 */
+  width: clamp(96px, 10.2vw, 196px);
+  height: auto;
+  opacity: 1;
+  filter: brightness(2.05) contrast(1.08) saturate(1.05)
+          drop-shadow(0 0 28px rgba(180, 20, 20, .45));
+  transform-origin: bottom center;
+  animation: skull-breathe 7s ease-in-out infinite;
+}
+@keyframes skull-breathe {
+  0%, 100% { opacity: .9; transform: scale(1); }
+  50%      { opacity: 1;   transform: scale(1.015); }
+}
+
+/* 无障碍：用户偏好减弱动效时静止 */
+@media (prefers-reduced-motion: reduce) {
+  .drip { animation: none; height: var(--h); opacity: .45; }
+  .drip::after { display: none; }
+  .horror-skull { animation: none; }
 }

@@ -80,6 +80,105 @@
     return `<span class="tag tag-style">${style || '本格'}</span>`;
   }
 
+  // 生成与海龟汤贴切的暗色氛围背景（确定性：同一条汤始终同款配色，无需网络）
+  function soupCoverStyle(title, type) {
+    let h = 0;
+    const s = String(title || '');
+    for (let i = 0; i < s.length; i++) h = ((h << 5) - h + s.charCodeAt(i)) | 0;
+    const r = Math.abs(h);
+    // 红汤偏暗红/绯色，清汤偏暗青/幽蓝，并按标题哈希微调色相
+    const hue = type === '红汤' ? 350 + (r % 30) : 195 + (r % 45);
+    return [
+      `radial-gradient(120% 140% at 18% 12%, hsl(${hue}, 60%, 30%) 0%, transparent 55%)`,
+      `radial-gradient(100% 120% at 85% 90%, hsl(${(hue + 40) % 360}, 45%, 22%) 0%, transparent 50%)`,
+      `linear-gradient(150deg, hsl(${(hue + 13) % 360}, 55%, 16%) 0%, hsl(${(hue + 26) % 360}, 50%, 7%) 100%)`
+    ].join(', ');
+  }
+
+  // ==================== 封面图选择器（写故事 / 上传故事 / 修改 三表单共用） ====================
+  // 选中图片后立即上传拿到文件名，提交表单时才绑定到汤上；clear 标记用于修改页移除封面
+  let coverState = { token: '', url: '', clear: false, original: '' };
+
+  function resetCoverState(originalUrl) {
+    coverState = { token: '', url: '', clear: false, original: originalUrl || '' };
+  }
+
+  function coverPickerHTML(p) {
+    return `
+      <div class="form-field cover-field">
+        <label>封面图（可选）</label>
+        <div class="cover-picker">
+          <div class="cover-preview" id="${p}CoverPreview" style="display:none">
+            <img id="${p}CoverImg" alt="封面预览" />
+          </div>
+          <div class="cover-btns">
+            <label class="upload-btn cover-btn">🖼 选择图片
+              <input type="file" id="${p}CoverInput" accept="image/jpeg,image/png,image/webp" />
+            </label>
+            <button type="button" class="btn btn-ghost cover-btn" id="${p}CoverClear" style="display:none">移除封面</button>
+          </div>
+        </div>
+        <p class="upload-hint">支持 jpg / png / webp，不超过 5MB；题库卡片会以此图为背景</p>
+      </div>`;
+  }
+
+  function refreshCoverPreview(p) {
+    const url = coverState.token ? coverState.url : coverState.original;
+    const show = !coverState.clear && !!url;
+    const prev = document.getElementById(p + 'CoverPreview');
+    const img = document.getElementById(p + 'CoverImg');
+    const clearBtn = document.getElementById(p + 'CoverClear');
+    if (prev) prev.style.display = show ? 'block' : 'none';
+    if (show && img) img.src = url;
+    if (clearBtn) clearBtn.style.display = show ? 'inline-flex' : 'none';
+  }
+
+  function bindCoverPicker(p) {
+    refreshCoverPreview(p);
+    const input = document.getElementById(p + 'CoverInput');
+    if (input) {
+      input.addEventListener('change', async () => {
+        const file = input.files[0];
+        input.value = '';
+        if (!file) return;
+        if (!['image/jpeg', 'image/png', 'image/webp'].includes(file.type)) {
+          toast('仅支持 jpg / png / webp 格式的图片', 'err');
+          return;
+        }
+        if (file.size > 5 * 1024 * 1024) {
+          toast('封面图片不能超过 5MB', 'err');
+          return;
+        }
+        try {
+          const data = await API.uploadCover(file);
+          coverState.token = data.data.file;
+          coverState.url = data.data.url;
+          coverState.clear = false;
+          refreshCoverPreview(p);
+          toast('封面已上传，提交表单后生效');
+        } catch (e) {
+          toast('封面上传失败：' + e.message, 'err');
+        }
+      });
+    }
+    const clearBtn = document.getElementById(p + 'CoverClear');
+    if (clearBtn) {
+      clearBtn.addEventListener('click', () => {
+        coverState.clear = true;
+        coverState.token = '';
+        coverState.url = '';
+        refreshCoverPreview(p);
+      });
+    }
+  }
+
+  // 提交时拼进 payload：有新图传 coverFile，标记移除传 coverClear
+  function coverPayload() {
+    if (coverState.token) return { coverFile: coverState.token };
+    if (coverState.clear) return { coverClear: true };
+    return {};
+  }
+
   // 未登录统一跳转登录页
   window.onUnauthorized = function () {
     if (location.pathname.endsWith('app.html')) {
@@ -201,43 +300,97 @@
         if (pgWrap) pgWrap.innerHTML = '';
         return;
       }
+      // 逐卡懒加载封面：距视口 300px 才预载，失败静默回退渐变底
+      function loadCardCover(card) {
+        const url = card.dataset.cover;
+        if (!url) return;
+        const img = new Image();
+        img.onload = () => {
+          const bg = card.querySelector('.soup-card-bg');
+          if (bg) bg.style.backgroundImage = 'url("' + url + '")';
+        };
+        img.onerror = () => { /* 加载失败保留渐变兜底层 */ };
+        img.src = url;
+      }
+
       listEl.innerHTML = list.map((s, i) => {
         const isMine = currentUser && s.authorId === currentUser.uid;
         // 仅自己添加的汤显示红色「修改」「删除」按钮
         const editBtns = isMine ? `
-          <button class="btn btn-danger" data-edit="${s.id}">修改</button>
-          <button class="btn btn-danger" data-delete="${s.id}">删除</button>
+          <button class="btn btn-danger btn-sm" data-edit="${s.id}">修改</button>
+          <button class="btn btn-danger btn-sm" data-delete="${s.id}">删除</button>
         ` : '';
+        const idx = (d.page - 1) * d.pageSize + i + 1;
         return `
-        <div class="soup-row">
-          <div class="soup-index">${(d.page - 1) * d.pageSize + i + 1}</div>
-          <div class="soup-main">
-            <div class="soup-title">${escapeHTML(s.title)}</div>
-            <div class="soup-tags">
+        <div class="soup-card" data-id="${s.id}" data-cover="${escapeHTML(s.coverUrl || '')}" role="button" tabindex="0" aria-label="预览 ${escapeHTML(s.title)}">
+          <div class="soup-card-fallback" style="background:${soupCoverStyle(s.title, s.type)}" aria-hidden="true"></div>
+          <div class="soup-card-bg" aria-hidden="true"></div>
+          <div class="soup-card-scrim" aria-hidden="true"></div>
+          <div class="soup-card-vignette" aria-hidden="true"></div>
+          <div class="soup-card-top">
+            <span class="soup-card-index">${idx}</span>
+            <span class="soup-card-stars">${starsHTML(s.difficulty)}</span>
+          </div>
+          <div class="soup-card-content">
+            <div class="soup-card-title">${escapeHTML(s.title)}</div>
+            <p class="soup-card-face">${escapeHTML(s.face || '')}</p>
+            <div class="soup-card-tags">
               ${typeTag(s.type)}
               ${styleTag(s.style)}
-              ${starsHTML(s.difficulty)}
               <span class="soup-author">by ${escapeHTML(s.author || '匿名')}</span>
             </div>
-          </div>
-          <div class="soup-actions">
-            ${editBtns}
-            <button class="btn btn-primary" data-preview="${s.id}">预览</button>
+            <div class="soup-card-actions">
+              ${editBtns}
+              <button class="btn btn-primary btn-sm" data-preview="${s.id}">预览</button>
+            </div>
           </div>
         </div>
       `;
       }).join('');
 
+      // 封面懒加载（IntersectionObserver 不可见不加载，与对方站策略一致）
+      const cards = listEl.querySelectorAll('.soup-card[data-cover]');
+      if ('IntersectionObserver' in window) {
+        const io = new IntersectionObserver((entries) => {
+          entries.forEach((en) => {
+            if (en.isIntersecting) {
+              loadCardCover(en.target);
+              io.unobserve(en.target);
+            }
+          });
+        }, { rootMargin: '300px' });
+        cards.forEach((c) => io.observe(c));
+      } else {
+        cards.forEach((c) => loadCardCover(c));
+      }
+
       listEl.querySelectorAll('[data-preview]').forEach((btn) => {
-        btn.addEventListener('click', () => openPreview(btn.dataset.preview));
+        btn.addEventListener('click', (e) => { e.stopPropagation(); openPreview(btn.dataset.preview); });
       });
       listEl.querySelectorAll('[data-edit]').forEach((btn) => {
-        btn.addEventListener('click', () => {
+        btn.addEventListener('click', (e) => {
+          e.stopPropagation();
           goto('#/edit/' + btn.dataset.edit);
         });
       });
       listEl.querySelectorAll('[data-delete]').forEach((btn) => {
-        btn.addEventListener('click', () => confirmDelete(btn.dataset.delete));
+        btn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          confirmDelete(btn.dataset.delete);
+        });
+      });
+      // 点卡片任意空白处 = 预览（按钮点击已阻断冒泡）
+      listEl.querySelectorAll('.soup-card').forEach((card) => {
+        card.addEventListener('click', (e) => {
+          if (e.target.closest('button')) return;
+          openPreview(card.dataset.id);
+        });
+        card.addEventListener('keydown', (e) => {
+          if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault();
+            openPreview(card.dataset.id);
+          }
+        });
       });
 
       renderPagination(pgWrap, d.total, d.page, d.totalPages);
@@ -426,6 +579,7 @@
               </select>
             </div>
           </div>
+          ${coverPickerHTML('w')}
         </div>
 
         <div class="dual-boxes">
@@ -447,6 +601,7 @@
     `;
     document.getElementById('wBack').addEventListener('click', renderAdd);
     document.getElementById('wSubmit').addEventListener('click', submitWrite);
+    bindCoverPicker('w');
   }
 
   async function submitWrite() {
@@ -465,7 +620,7 @@
     btn.disabled = true;
     btn.textContent = '提交中...';
     try {
-      await API.createSoup({ title, face, bottom, type, style, difficulty });
+      await API.createSoup({ title, face, bottom, type, style, difficulty, ...coverPayload() });
       toast('添加成功！');
       goto('#/library');
     } catch (e) {
@@ -542,6 +697,7 @@
               </select>
             </div>
           </div>
+          ${coverPickerHTML('u')}
           <div style="display:flex; gap:12px; justify-content:flex-end;">
             <button class="btn btn-ghost" id="uBack">返回</button>
             <button class="btn btn-primary" id="uSubmit">确认入库</button>
@@ -552,6 +708,7 @@
     document.getElementById('uBack').addEventListener('click', renderAdd);
     document.getElementById('uSubmit').addEventListener('click', submitUpload);
     document.getElementById('fileInput').addEventListener('change', handleFile);
+    bindCoverPicker('u');
   }
 
   let uploadedData = null;
@@ -599,7 +756,7 @@
     btn.disabled = true;
     btn.textContent = '入库中...';
     try {
-      await API.createSoup({ title, face, bottom, type, style, difficulty });
+      await API.createSoup({ title, face, bottom, type, style, difficulty, ...coverPayload() });
       toast('添加成功！');
       goto('#/library');
     } catch (e) {
@@ -663,6 +820,7 @@
                 </select>
               </div>
             </div>
+            ${coverPickerHTML('e')}
           </div>
 
           <div class="dual-boxes">
@@ -684,6 +842,8 @@
       `;
       document.getElementById('eCancel').addEventListener('click', () => { goto('#/library'); });
       document.getElementById('eSave').addEventListener('click', () => submitEdit(id));
+      resetCoverState(s.coverUrl || '');
+      bindCoverPicker('e');
     } catch (e) {
       main.innerHTML = `<div class="page"><div class="empty"><p>加载失败：${escapeHTML(e.message)}</p></div></div>`;
     }
@@ -705,7 +865,7 @@
     btn.disabled = true;
     btn.textContent = '保存中...';
     try {
-      await API.updateSoup(id, { title, face, bottom, type, style, difficulty });
+      await API.updateSoup(id, { title, face, bottom, type, style, difficulty, ...coverPayload() });
       await niceAlert('保存成功');
       goto('#/library');
     } catch (e) {
@@ -821,6 +981,13 @@
           <p style="font-size:14px;color:var(--ink-soft);margin-bottom:16px;">
             默认使用内置离线引擎；开启「大模型主持」后优先调用大模型判断，失败自动退回离线引擎。
           </p>
+
+          <!-- 当前生效的引擎状态：保存后实时更新，让用户明确知道现在是哪种模式 -->
+          <div class="engine-status" id="stStatus">
+            <span class="engine-status-dot"></span>
+            <span class="engine-status-text" id="stStatusText">当前引擎：内置离线引擎</span>
+          </div>
+
           <div class="engine-switch-row">
             <div>
               <div class="engine-switch-title">大模型主持</div>
@@ -848,6 +1015,12 @@
               <button class="btn btn-primary" id="stSave">保存设置</button>
             </div>
           </div>
+
+          <!-- 保存不是终点：给一个明确的「去开玩」出口，避免设置页变成死路 -->
+          <div class="engine-cta">
+            <button class="btn btn-primary btn-block" id="stGoPlay">保存并开始游戏 →</button>
+            <p class="engine-cta-hint" id="stCtaHint">选一碗汤，与 AI 汤主展开推理对决</p>
+          </div>
         </div>
       </div>
     `;
@@ -866,15 +1039,32 @@
     const fBase = document.getElementById('stBaseUrl');
     const fKey = document.getElementById('stApiKey');
     const fModel = document.getElementById('stModel');
+    const statusEl = document.getElementById('stStatus');
+    const statusText = document.getElementById('stStatusText');
+    const ctaHint = document.getElementById('stCtaHint');
 
     fBase.value = savedSettings.llmBaseUrl || '';
     fModel.value = savedSettings.llmModel || '';
     fKey.value = savedSettings.llmApiKey || '';
 
+    // 引擎状态提示：保存后/切开关时同步刷新，让用户随时知道「现在是哪种模式」
+    function setEngineStatus(enabled) {
+      statusEl.classList.toggle('is-llm', !!enabled);
+      statusText.textContent = enabled
+        ? '当前引擎：大模型主持（调用失败会自动退回离线引擎）'
+        : '当前引擎：内置离线引擎（无需联网，零成本）';
+      if (ctaHint) {
+        ctaHint.textContent = enabled
+          ? '已启用大模型主持，选一碗汤开始推理吧'
+          : '选一碗汤，与 AI 汤主展开推理对决';
+      }
+    }
+
     function syncSwitch() {
       const on = sw.getAttribute('aria-checked') === 'true';
       sw.classList.toggle('on', on);
       fields.style.display = on ? 'block' : 'none';
+      setEngineStatus(on);
     }
     sw.setAttribute('aria-checked', savedSettings.enabled ? 'true' : 'false');
     syncSwitch();
@@ -885,28 +1075,44 @@
       syncSwitch();
     });
 
-    document.getElementById('stSave').addEventListener('click', async () => {
+    // 表单 → 持久化（保存按钮与「保存并开始游戏」共用，避免两处逻辑不一致）
+    // 返回 true 表示保存成功（或无需保存）
+    async function persistSettings(triggerBtn, busyText) {
       const enabled = sw.getAttribute('aria-checked') === 'true';
       const baseUrl = fBase.value.trim();
       const apiKey = fKey.value.trim();
       const model = fModel.value.trim();
       if (enabled && (!baseUrl || !apiKey)) {
         niceAlert('开启大模型主持需要填写 API Base URL 和 API Key');
-        return;
+        return false;
       }
-      const btn = document.getElementById('stSave');
-      btn.disabled = true; btn.textContent = '保存中...';
+      const oldText = triggerBtn.textContent;
+      triggerBtn.disabled = true; triggerBtn.textContent = busyText;
       try {
         await API.aiSaveSettings({ enabled, llmBaseUrl: baseUrl, llmModel: model, llmApiKey: apiKey });
-        toast('设置已保存');
-        // 保存后重新拉取，Key 回显以服务端为准
+        // 保存后重新拉取：Key 回显以服务端为准，状态提示同步刷新
         const fresh = await API.aiGetSettings();
-        fKey.value = fresh.data.settings.llmApiKey || '';
+        const s = fresh.data.settings || {};
+        fKey.value = s.llmApiKey || '';
+        setEngineStatus(!!s.enabled);
+        return true;
       } catch (e) {
         toast('保存失败：' + e.message, 'err');
+        return false;
       } finally {
-        btn.disabled = false; btn.textContent = '保存设置';
+        triggerBtn.disabled = false; triggerBtn.textContent = oldText;
       }
+    }
+
+    document.getElementById('stSave').addEventListener('click', async () => {
+      const ok = await persistSettings(document.getElementById('stSave'), '保存中...');
+      if (ok) toast('设置已保存');
+    });
+
+    // 保存并开始游戏：设置页不再是死路
+    document.getElementById('stGoPlay').addEventListener('click', async () => {
+      const ok = await persistSettings(document.getElementById('stGoPlay'), '保存中...');
+      if (ok) goto('#/ai/play');
     });
 
     document.getElementById('stTest').addEventListener('click', async () => {
@@ -1299,6 +1505,9 @@
         soupId: gameState.soupId,
         face: gameState.face,
         bottom: gameState.bottom,
+        // 题目分类字段：离线引擎回答「这是本格吗 / 是红汤吗」时要用（缺了会一律答无关紧要）
+        type: gameState.type,
+        style: gameState.style,
         history: gameState.history,
         question: question,
         lastProgress: gameState.lastProgress,

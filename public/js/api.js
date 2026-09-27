@@ -76,6 +76,23 @@
       return this.request('POST', '/api/upload', fd, true);
     },
 
+    // 封面图上传：原始字节流直传（非 multipart），服务端按魔数校验格式
+    async uploadCover(file) {
+      const headers = {};
+      if (this.token) headers['Authorization'] = 'Bearer ' + this.token;
+      if (file && file.type) headers['Content-Type'] = file.type;
+      const res = await fetch('/api/soup-cover', { method: 'POST', headers, body: file });
+      let data = null;
+      try { data = await res.json(); } catch (e) { data = {}; }
+      if (res.status === 401) {
+        this.setToken('');
+        if (typeof global.onUnauthorized === 'function') global.onUnauthorized();
+        throw new Error(data.message || '未登录或登录已过期');
+      }
+      if (!res.ok) throw new Error(data.message || '封面上传失败（' + res.status + '）');
+      return data;
+    },
+
     // AI 陪玩
     aiAsk(payload) {
       return this.request('POST', '/api/ai/ask', payload);

@@ -14,6 +14,23 @@
     <span class="theme-icon" id="themeIcon">🌙</span>
   </button>
 
+  <!-- 关灯（黑夜模式）才显示的恐怖装饰层：顶部血迹滴落 + 右下角骷髅。
+       纯装饰：pointer-events 关闭、不遮挡内容（z-index 低于主内容） -->
+  <div class="horror-layer" aria-hidden="true">
+    <div class="blood-drips">
+      <i class="drip" style="--x:7%;  --w:3px; --h:130px; --t:9s;    --d:0s"></i>
+      <i class="drip" style="--x:12%; --w:2px; --h:90px;  --t:12s;   --d:3.5s"></i>
+      <i class="drip" style="--x:23%; --w:4px; --h:170px; --t:11s;   --d:1.8s"></i>
+      <i class="drip" style="--x:37%; --w:2px; --h:70px;  --t:14s;   --d:6s"></i>
+      <i class="drip" style="--x:52%; --w:3px; --h:150px; --t:10s;   --d:4.2s"></i>
+      <i class="drip" style="--x:64%; --w:2px; --h:100px; --t:13s;   --d:2.6s"></i>
+      <i class="drip" style="--x:78%; --w:4px; --h:180px; --t:12.5s; --d:0.9s"></i>
+      <i class="drip" style="--x:88%; --w:2px; --h:80px;  --t:15s;   --d:5.1s"></i>
+      <i class="drip" style="--x:95%; --w:3px; --h:120px; --t:10.5s; --d:3s"></i>
+    </div>
+    <img class="horror-skull" src="/img/skull.png" alt="" />
+  </div>
+
   <div class="app-shell">
     <!-- 左侧侧边导航栏 -->
     <aside class="sidebar">

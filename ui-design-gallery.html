@@ -1,0 +1,373 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>UI 设计灵感 · 100 个优秀网站</title>
+<style>
+  :root {
+    --bg: #0e0f11;
+    --panel: #17181c;
+    --panel-2: #1e1f24;
+    --ink: #e8e6e1;
+    --muted: #8b8a86;
+    --accent: #ff5c35;
+    --accent-2: #ffb300;
+    --line: rgba(255,255,255,.08);
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html { scroll-behavior: smooth; }
+  body {
+    background: var(--bg);
+    color: var(--ink);
+    font-family: "Georgia", "Iowan Old Style", "Songti SC", "SimSun", serif;
+    -webkit-font-smoothing: antialiased;
+    padding: 0 0 80px;
+  }
+  /* header */
+  header {
+    padding: 72px 32px 40px;
+    max-width: 1200px;
+    margin: 0 auto;
+    position: relative;
+  }
+  header .kicker {
+    font-family: ui-monospace, "SF Mono", "Cascadia Code", monospace;
+    font-size: 12px;
+    letter-spacing: .28em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin-bottom: 18px;
+  }
+  header h1 {
+    font-size: clamp(40px, 7vw, 84px);
+    line-height: 1;
+    font-weight: 400;
+    letter-spacing: -.02em;
+  }
+  header h1 em {
+    font-style: italic;
+    color: var(--accent-2);
+  }
+  header p.sub {
+    margin-top: 22px;
+    max-width: 560px;
+    font-size: 16px;
+    line-height: 1.7;
+    color: var(--muted);
+    font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  }
+  /* nav */
+  nav.toc {
+    max-width: 1200px;
+    margin: 8px auto 0;
+    padding: 0 32px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    position: sticky;
+    top: 0;
+    z-index: 20;
+    background: linear-gradient(var(--bg) 70%, transparent);
+    padding-top: 16px;
+    padding-bottom: 20px;
+  }
+  nav.toc a {
+    font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    font-size: 13px;
+    text-decoration: none;
+    color: var(--muted);
+    border: 1px solid var(--line);
+    padding: 7px 14px;
+    border-radius: 999px;
+    transition: all .2s ease;
+  }
+  nav.toc a:hover { color: var(--ink); border-color: var(--accent); background: rgba(255,92,53,.08); }
+  /* sections */
+  main { max-width: 1200px; margin: 0 auto; padding: 0 32px; }
+  section.cat { margin-top: 56px; }
+  section.cat > h2 {
+    font-size: 22px;
+    font-weight: 400;
+    letter-spacing: -.01em;
+    padding-bottom: 12px;
+    border-bottom: 1px solid var(--line);
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+  }
+  section.cat > h2 .num {
+    font-family: ui-monospace, "SF Mono", monospace;
+    font-size: 13px;
+    color: var(--accent);
+  }
+  section.cat > h2 .cnt {
+    font-family: ui-monospace, "SF Mono", monospace;
+    font-size: 12px;
+    color: var(--muted);
+  }
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+    gap: 12px;
+    margin-top: 20px;
+  }
+  a.site {
+    display: block;
+    text-decoration: none;
+    color: var(--ink);
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    padding: 18px 18px 16px;
+    transition: transform .18s ease, border-color .18s ease, background .18s ease;
+    position: relative;
+    overflow: hidden;
+  }
+  a.site::after {
+    content: "→";
+    position: absolute;
+    top: 18px; right: 18px;
+    font-family: ui-monospace, monospace;
+    color: var(--muted);
+    opacity: 0;
+    transform: translateX(-6px);
+    transition: all .18s ease;
+  }
+  a.site:hover {
+    transform: translateY(-3px);
+    border-color: var(--accent);
+    background: var(--panel-2);
+  }
+  a.site:hover::after { opacity: 1; transform: translateX(0); color: var(--accent); }
+  a.site .name {
+    font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    font-size: 17px;
+    font-weight: 600;
+    margin-bottom: 6px;
+  }
+  a.site .url {
+    font-family: ui-monospace, "SF Mono", monospace;
+    font-size: 11px;
+    color: var(--muted);
+    margin-bottom: 10px;
+    word-break: break-all;
+  }
+  a.site .note {
+    font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    font-size: 13px;
+    line-height: 1.5;
+    color: var(--muted);
+  }
+  footer {
+    max-width: 1200px;
+    margin: 80px auto 0;
+    padding: 0 32px;
+    color: var(--muted);
+    font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    font-size: 13px;
+    text-align: center;
+  }
+</style>
+</head>
+<body>
+<header>
+  <div class="kicker">Curated UI Reference</div>
+  <h1>100 个值得<br>学习与模仿的<em>网站</em></h1>
+  <p class="sub">按类型分类整理。点击任意卡片即可在右侧浏览器中打开对应网站，观察它们的配色、排版、留白与微交互。链接均指向官网首页。</p>
+</header>
+
+<nav class="toc" id="toc"></nav>
+
+<main id="main"></main>
+
+<footer>共 100 个站点 · 点击卡片在新标签页打开对应官网</footer>
+
+<script>
+const data = [
+  { cat: "灵感聚合站", sites: [
+    ["Awwwards", "https://www.awwwards.com", "全球最权威的网页设计奖，每日更新获奖作品"],
+    ["Behance", "https://www.behance.net", "Adobe 设计师作品集社区"],
+    ["Dribbble", "https://dribbble.com", "高质量 UI / 动效细节截图"],
+    ["Mobbin", "https://mobbin.com", "真实 App 界面库，可搜索具体页面"],
+    ["Land-book", "https://land-book.com", "落地页精选"],
+    ["SiteInspire", "https://www.siteinspire.com", "杂志风网页灵感"],
+    ["Godly", "https://godly.website", "最新的极简 / 动效作品"],
+    ["Muzli", "https://muz.li", "设计灵感浏览器插件"],
+    ["Page Flows", "https://pageflows.com", "真实产品的用户流程录制"],
+    ["Dark Mode Design", "https://www.darkmodedesign.com", "深色模式界面合集"],
+  ]},
+  { cat: "SaaS / 企业服务", sites: [
+    ["Notion", "https://www.notion.so", "极简排版、命令面板、信息密度控制"],
+    ["Linear", "https://linear.app", "现代软件美学的标杆，深色主题典范"],
+    ["Figma", "https://www.figma.com", "工具型产品的视觉与导航"],
+    ["Slack", "https://slack.com", "品牌色彩与产品内交互"],
+    ["Loom", "https://www.loom.com", "友好的登录页与引导"],
+    ["Stripe", "https://stripe.com", "开发者营销页的叙事与动效"],
+    ["Vercel", "https://vercel.com", "极简科技感"],
+    ["Whimsical", "https://whimsical.com", "柔和插画风"],
+    ["Miro", "https://miro.com", "白板产品的信息架构"],
+    ["Dropbox", "https://www.dropbox.com", "品牌重塑后的插画体系"],
+  ]},
+  { cat: "电商 / 零售", sites: [
+    ["Apple", "https://www.apple.com", "产品页滚动画布叙事"],
+    ["Nike", "https://www.nike.com", "强视觉冲击的营销页"],
+    ["Allbirds", "https://www.allbirds.com", "自然材质与温柔配色"],
+    ["Glossier", "https://www.glossier.com", "极简美妆品牌气质"],
+    ["Away", "https://www.awaytravel.com", "旅行箱品牌的拼接排版"],
+    ["Warby Parker", "https://www.warbyparker.com", "干净的商品展示与配色"],
+    ["Rimowa", "https://www.rimowa.com", "奢侈品的克制动效"],
+    ["Farfetch", "https://www.farfetch.com", "奢侈电商的信息分级"],
+    ["Aesop", "https://www.aesop.com", "高级感的留白与字体"],
+    ["Sonos", "https://www.sonos.com", "产品与插画的融合"],
+  ]},
+  { cat: "金融科技", sites: [
+    ["Stripe", "https://stripe.com", "金融叙事设计标杆"],
+    ["Robinhood", "https://robinhood.com", "投资工具的极简交互"],
+    ["Coinbase", "https://www.coinbase.com", "加密产品的信任感设计"],
+    ["Revolut", "https://www.revolut.com", "卡面与霓虹配色系统"],
+    ["N26", "https://n26.com", "欧洲新银行简洁风"],
+    ["Mercury", "https://mercury.com", "高级感的渐变与排版"],
+    ["Ramp", "https://ramp.com", "企业支出的现代风格"],
+    ["Chime", "https://www.chime.com", "亲民的绿色品牌"],
+    ["Plaid", "https://plaid.com", "金融基础设施的科技美学"],
+    ["Wealthfront", "https://www.wealthfront.com", "数据可视化与信任传达"],
+  ]},
+  { cat: "内容 / 媒体", sites: [
+    ["Medium", "https://medium.com", "阅读体验与排版"],
+    ["Spotify", "https://www.spotify.com", "色彩与音乐的动感"],
+    ["Netflix", "https://www.netflix.com", "瀑布流与影片预览"],
+    ["The Verge", "https://www.theverge.com", "科技媒体的信息密度"],
+    ["Vogue", "https://www.vogue.com", "时尚杂志的数字排版"],
+    ["Bloomberg", "https://www.bloomberg.com", "数据新闻的可视化"],
+    ["The New York Times", "https://www.nytimes.com", "长文阅读与交互叙事"],
+    ["Pitchfork", "https://pitchfork.com", "音乐评论的编辑设计"],
+    ["NPR", "https://www.npr.org", "新闻的可读性与无障碍"],
+    ["BBC", "https://www.bbc.com", "大规模媒体的信息架构"],
+  ]},
+  { cat: "旅游 / 生活方式", sites: [
+    ["Airbnb", "https://www.airbnb.com", "搜索体验与卡片设计"],
+    ["Booking.com", "https://www.booking.com", "高转化率的列表页"],
+    ["Hopper", "https://www.hopper.com", "价格预测的数据动画"],
+    ["Klook", "https://www.klook.com", "目的地发现与彩色分类"],
+    ["Campspace", "https://campspace.com", "户外自然的柔和配色"],
+    ["Airstream", "https://www.airstream.com", "复古露营车的品牌气质"],
+    ["Canopy & Stars", "https://www.canopyandstars.co.uk", "精品住宿的诗意插画"],
+    ["Lonely Planet", "https://www.lonelyplanet.com", "旅游内容的编辑排版"],
+    ["Expedia", "https://www.expedia.com", "旅游预订的聚合体验"],
+    ["Culture Trip", "https://theculturetrip.com", "目的地内容的杂志化"],
+  ]},
+  { cat: "教育 / 知识", sites: [
+    ["Duolingo", "https://www.duolingo.com", "游戏化与吉祥物情感设计"],
+    ["Coursera", "https://www.coursera.org", "课程卡片与信任体系"],
+    ["Khan Academy", "https://www.khanacademy.org", "学习路径的清晰导航"],
+    ["MasterClass", "https://www.masterclass.com", "电影感的导师宣传页"],
+    ["Brilliant", "https://brilliant.org", "数学的可视化教学"],
+    ["Udemy", "https://www.udemy.com", "大规模课程的搜索体验"],
+    ["Skillshare", "https://www.skillshare.com", "社区感的分类浏览"],
+    ["Quizlet", "https://quizlet.com", "记忆工具的微交互"],
+    ["edX", "https://www.edx.org", "学院派的正统 UI"],
+    ["SuperHi", "https://www.superhi.com", "创意课程网站的活泼排版"],
+  ]},
+  { cat: "社交 / 社区", sites: [
+    ["Discord", "https://discord.com", "游戏化品牌的视觉世界"],
+    ["Twitter / X", "https://x.com", "极简时间线的克制设计"],
+    ["Pinterest", "https://www.pinterest.com", "瀑布流与视觉检索"],
+    ["Reddit", "https://www.reddit.com", "信息密度与社区层级"],
+    ["GitHub", "https://github.com", "开发者工具的可读性"],
+    ["Product Hunt", "https://www.producthunt.com", "产品社区的浏览体验"],
+    ["Twitch", "https://www.twitch.tv", "直播平台的信息架构"],
+    ["Letterboxd", "https://letterboxd.com", "影迷社区的复古排版"],
+    ["Arc Browser", "https://arc.net", "浏览器产品的创新交互"],
+    ["Dribbble", "https://dribbble.com", "社区型作品展示"],
+  ]},
+  { cat: "健康 / 身心", sites: [
+    ["Calm", "https://www.calm.com", "舒缓的声音与呼吸动效"],
+    ["Headspace", "https://www.headspace.com", "友好插画与温暖色彩"],
+    ["Whoop", "https://www.whoop.com", "运动数据的深色专业感"],
+    ["Strava", "https://www.strava.com", "运动数据可视化与社区激励"],
+    ["Noom", "https://www.noom.com", "减肥应用的心理驱动设计"],
+    ["Zocdoc", "https://www.zocdoc.com", "就医预约的清晰流程"],
+    ["Hims", "https://www.hims.com", "医疗品牌的现代美学"],
+    ["Peloton", "https://www.onepeloton.com", "健身会员的沉浸首页"],
+    ["Sleep Cycle", "https://www.sleepcycle.com", "睡眠数据的可视化"],
+    ["Oura", "https://ouraring.com", "健康戒指的外观与数据美感"],
+  ]},
+  { cat: "招聘 / 作品集 / 个人站", sites: [
+    ["LinkedIn", "https://www.linkedin.com", "专业社交的信息架构"],
+    ["AngelList", "https://www.angellist.com", "初创求职的极简流"],
+    ["Bruno Simon", "https://bruno-simon.com", "WebGL 3D 交互标杆"],
+    ["Rally", "https://rally.io", "数据仪表盘的现代美学"],
+    ["Gumroad", "https://gumroad.com", "创作者电商的清晰购买流"],
+    ["Mailchimp", "https://mailchimp.com", "营销工具的友好插画"],
+    ["Intercom", "https://www.intercom.com", "客服产品的品牌色彩"],
+    ["Akqa", "https://www.akqa.com", "创意公司的前卫动效"],
+    ["Studio Feixen", "https://studiofeixen.ch", "瑞士设计工作室的排版实验"],
+    ["Duolingo", "https://www.duolingo.com", "趣味化品牌与吉祥物"],
+  ]},
+];
+
+const main = document.getElementById('main');
+const toc = document.getElementById('toc');
+let total = 0;
+
+data.forEach((group, gi) => {
+  total += group.sites.length;
+
+  const tocLink = document.createElement('a');
+  tocLink.href = '#cat-' + gi;
+  tocLink.textContent = group.cat;
+  toc.appendChild(tocLink);
+
+  const section = document.createElement('section');
+  section.className = 'cat';
+  section.id = 'cat-' + gi;
+
+  const h2 = document.createElement('h2');
+  const num = document.createElement('span');
+  num.className = 'num';
+  num.textContent = String(gi + 1).padStart(2, '0');
+  const title = document.createElement('span');
+  title.textContent = group.cat;
+  const cnt = document.createElement('span');
+  cnt.className = 'cnt';
+  cnt.textContent = group.sites.length + ' 个';
+  h2.appendChild(num);
+  h2.appendChild(title);
+  h2.appendChild(cnt);
+  section.appendChild(h2);
+
+  const grid = document.createElement('div');
+  grid.className = 'grid';
+
+  group.sites.forEach(([name, url, note]) => {
+    const a = document.createElement('a');
+    a.className = 'site';
+    a.href = url;
+    a.target = '_blank';
+    a.rel = 'noopener';
+
+    const nm = document.createElement('div');
+    nm.className = 'name';
+    nm.textContent = name;
+    const u = document.createElement('div');
+    u.className = 'url';
+    u.textContent = url.replace(/^https?:\/\//, '');
+    const n = document.createElement('div');
+    n.className = 'note';
+    n.textContent = note;
+
+    a.appendChild(nm);
+    a.appendChild(u);
+    a.appendChild(n);
+    grid.appendChild(a);
+  });
+
+  section.appendChild(grid);
+  main.appendChild(section);
+});
+
+document.querySelector('footer').textContent = `共 ${total} 个站点 · 点击卡片在新标签页打开对应官网`;
+</script>
+</body>
+</html>
