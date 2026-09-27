@@ -1,0 +1,12 @@
+{"id":1,"soupId":"s1","question":"这个汤是本格吗？","expected":"是","layer":"问分类"}
+{"id":2,"soupId":"s1","question":"故事里有人死了吗？","expected":"是","layer":"问有没有死人"}
+{"id":3,"soupId":"s1","question":"男人年轻的时候遇难了吗？","expected":"是","layer":"同义词","note":"汤底写的是「男子」，玩家说「男人」"}
+{"id":4,"soupId":"s1","question":"他不是自杀的吗？","expected":"是","layer":"反问句"}
+{"id":5,"soupId":"s1","question":"他没有自杀吗？","expected":"否","layer":"否定提问"}
+{"id":6,"soupId":"s1","question":"他杀了人吗？","expected":"不是","layer":"问某个人","note":"男子只是吃了同伴的肉，并没有直接杀人"}
+{"id":7,"soupId":"s2","question":"有人死了吗？","expected":"有","layer":"问有没有死人"}
+{"id":8,"soupId":"s2","question":"宿舍真的是宿舍吗？","expected":"否","layer":"问某个地点"}
+{"id":9,"soupId":"s2","question":"老大死了吗","expected":"否","layer":"问某个人"}
+{"id":10,"soupId":"s3","question":"这个故事是本格吗？","expected":"是","layer":"问分类"}
+{"id":11,"soupId":"s3","question":"他和家人都死了吗？","expected":"是或不是","layer":"混合极性"}
+{"id":12,"soupId":"s1","question":"为什么他要自杀？","expected":"无关紧要","layer":"开放式提问"}
