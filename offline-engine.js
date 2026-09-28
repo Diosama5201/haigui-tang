@@ -426,13 +426,48 @@ function extractKeywords(bottom) {
   return words.sort((a, b) => b.score - a.score || b.c - a.c);
 }
 
-/** 判断玩家提问是否为开放式（非是非题） */
+/**
+ * 判断玩家提问是否为开放式（非是非题）
+ *
+ * 【缺陷根因（2026-09-28 修复）】旧实现用「句尾疑问标记」判定是非题：
+ *   if (q.endsWith('吗') || ... || q.endsWith('?')) return false;   // 只认句尾标记
+ *   return !q.endsWith('吗');   // ← 恒真：能走到这里的句子必然不以「吗」结尾
+ * 后果：同一句话带不带问号走完全不同的分支——
+ *   带「？」 → 判为是非题 → 走分句极性对比 → 正确作答
+ *   不带「？」 → 被误判开放式 → 直接回「无关紧要」（reason: open-question）
+ *   玩家（尤其手机输入）经常不打问号，于是同一问题一会「是」一会「无关紧要」；
+ *   若汤底含否定成分，两条分支的极性对比还会反向，出现「是/否」翻转（线上截图实证）。
+ *
+ * 【修复思路】按特殊疑问标记词检测，而非对整句疑问句式的判定：
+ *   - 只有以明确的特殊疑问词开头（为什么/怎么/谁/什么…）才判开放式；
+ *   - 「是不是 / 是否 / 对不对 / 吗 / ？」等封闭疑问标记命中 → 是非题（走判定层）；
+ *   - 其余一律默认是非题：海龟汤玩家几乎只问是非题，真正开放的问题都会被
+ *     第一条拦住；闲聊式陈述走判定层后自然落「无关紧要」，与旧行为殊途同归，
+ *     但不再错杀不带问号的是非题——句尾有没有问号不再影响任何判定。
+ */
+/** 封闭式（是非题）疑问标记——多字词按「句中包含」检测 */
+const CLOSED_PHRASES = [
+  '是不是', '是否', '对不对', '能不能', '有没有', '行不行',
+  '要不要', '会不会', '可不可以', '存不存在', '该不该', '算不算',
+];
+
 function isOpenQuestion(question) {
   const q = String(question || '').trim();
-  if (q.endsWith('吗') || q.endsWith('么') || q.endsWith('？') || q.endsWith('?')) return false;
-  if (OPEN_WH.some((w) => q.startsWith(w))) return true;
-  if (q.includes('还是')) return true; // 选择题
-  return !q.endsWith('吗');
+  if (!q) return false;
+  // 1) 选择疑问（「他是自杀还是他杀」）→ 开放式
+  if (q.includes('还是')) return true;
+  // 2) 句中含特殊疑问词 → 开放式
+  //    「为什么」「怎么」「谁」「什么」等一旦出现，无论句首还是句中、带不带问号，
+  //    都说明玩家在索要具体信息，而非求证是非（「他为什么这么做」「他为什么这么做？」都是开放）。
+  if (OPEN_WH.some((w) => q.includes(w))) return true;
+  // 3) 封闭疑问标记命中（多字词任意位置）→ 是非题
+  //    放在特殊疑问词之后，保证「是不是什么都没做」这类含「什么」的仍判是非题
+  if (CLOSED_PHRASES.some((w) => q.includes(w))) return false;
+  // 4) 句尾疑问语气词 / 问号 → 是非题（单独判句尾，避免「吗啡」词中误命中；
+  //    「吧」表推测确认，同样归是非题）
+  if (/[吗么吧？?]\s*$/.test(q)) return false;
+  // 5) 其余（不带任何疑问标记的陈述式提问）默认按是非题走判定层
+  return false;
 }
 
 /** 检测提问中是否有否定语义（且否定的是实体而非整句反问） */
@@ -563,22 +598,29 @@ function analyzeNegation(question, matchedTokens, requireScope) {
   const needScope = requireScope !== false;
   if (!q) return { neg: false, kind: 'none' };
 
-  if (DOUBLE_NEG_PATTERNS.some((p) => q.includes(p))) {
+  // 封闭疑问标记里的「不/否」不是否定语素：「是不是有」「有没有」里「是不是」≠ 否定。
+  // 先把这些标记词替换成等长占位符，再判否定，避免「这个牧场是不是有特殊能力」被误判成否定。
+  const stripped = CLOSED_PHRASES.reduce(
+    (acc, w) => acc.split(w).join('　'.repeat(w.length)),
+    q
+  );
+
+  if (DOUBLE_NEG_PATTERNS.some((p) => stripped.includes(p))) {
     return { neg: false, kind: 'double-negation' };
   }
   // 反问句「不是……吗 / 不是……么 / 不是……？」：语气是肯定
-  if (/不是/.test(q) && /[吗么？?]\s*$/.test(q)) {
+  if (/不是/.test(stripped) && /[吗么？?]\s*$/.test(stripped)) {
     return { neg: false, kind: 'rhetorical' };
   }
 
-  const hit = firstNegation(q);
+  const hit = firstNegation(stripped);
   if (!hit) return { neg: false, kind: 'none' };
 
   if (!needScope) return { neg: true, kind: 'negated-unscoped' };
 
   // 作用域：否定词必须紧邻（前后 3 字内）某个命中的词元
   const scoped = (matchedTokens || []).some((w) => {
-    const i = q.indexOf(w);
+    const i = stripped.indexOf(w);
     return i !== -1 && Math.abs(i - hit.idx) <= 3 + w.length;
   });
   return scoped ? { neg: true, kind: 'negated' } : { neg: false, kind: 'out-of-scope' };
