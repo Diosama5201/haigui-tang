@@ -51,6 +51,12 @@
           <svg viewBox="0 0 24 24"><path d="M11 5h2v6h6v2h-6v6h-2v-6H5v-2h6z"/></svg>
           <span>添加海龟汤</span>
         </a>
+        <!-- 管理者入口：需口令验证（口令由服务器 ADMIN_PASSWORD 环境变量提供）。
+             刻意放在导航末尾并 push 到底部，与普通功能项区分开。 -->
+        <a href="#/admin" class="nav-item nav-item-admin" id="adminNav" data-route="admin" title="需要管理者口令">
+          <svg viewBox="0 0 24 24"><path d="M12 2 4 5.5v6c0 4.6 3.4 8.6 8 10 4.6-1.4 8-5.4 8-10v-6L12 2zm0 5a3 3 0 0 1 1.5 5.6V16h-3v-3.4A3 3 0 0 1 12 7z"/></svg>
+          <span>管理者入口</span>
+        </a>
       </nav>
       <div class="sidebar-footer">
         <div class="user-chip" id="userChip" title="点击修改 AI 接口配置">

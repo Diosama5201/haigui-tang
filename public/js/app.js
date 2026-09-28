@@ -243,6 +243,7 @@
     add: renderAdd,
     ai: renderAIConfig,
     settings: renderSettings,
+    admin: renderAdmin,
   };
 
   function parseRoute() {
@@ -1675,6 +1676,481 @@
     });
   }
 
+  // ==================== 管理者入口（RAG 知识库） ====================
+  // 三道门：
+  //   ① 必须是登录用户（服务端校验）
+  //   ② 必须通过管理者口令换取管理令牌（有效期 2 小时）
+  //   ③ 令牌存 sessionStorage —— 关掉标签页即失效，不会长期留在浏览器里
+  //
+  // 这个页面做的事：上传「汤面 / 汤底 / 推理逻辑」txt → 服务端解析成「一题一块」入向量库。
+  // 玩家在 AI 陪玩中提问时，服务端用提问检索知识库并把命中内容注入汤主提示词；
+  // 因为检索与注入都在服务端，全站用户（含各自配置自己的大模型的用户）自动共享这份知识库。
+
+  async function renderAdmin() {
+    if (!API.adminToken) return renderAdminGate();
+
+    let stats = null;
+    let warn = '';
+    try {
+      const r = await API.adminStats();
+      stats = r.data;
+    } catch (e) {
+      // admin 标记 = 管理令牌失效，回到门禁重新验证；其他错误（如数据库未就绪）在面板内提示
+      if (e && e.admin) return renderAdminGate(e.message);
+      warn = (e && e.message) || '读取知识库概览失败';
+    }
+    return renderAdminPanel(stats, warn);
+  }
+
+  // 口令门禁
+  function renderAdminGate(errMsg) {
+    main.innerHTML = `
+      <div class="page">
+        <div class="page-head">
+          <h1 class="page-title">🔐 管理者入口</h1>
+          <p class="page-desc">验证管理者口令后可上传海龟汤知识库（汤面 / 汤底 / 推理逻辑）</p>
+        </div>
+
+        <div class="form-card admin-gate">
+          <div class="admin-gate-icon">🛡️</div>
+          <h3>口令验证</h3>
+          <p class="admin-gate-desc">
+            知识库会作为<strong>判题参考</strong>注入 AI 陪玩的汤主提示词，供全站用户共享。
+            检索与注入都在服务端完成，因此用户各自配置的大模型会自动用上这份知识库。
+            由于语料包含汤底与推理逻辑，为避免真相外泄，此入口仅管理者可用。
+          </p>
+
+          ${errMsg ? `<div class="admin-alert err">${escapeHTML(errMsg)}</div>` : ''}
+
+          <div class="form-field">
+            <label>管理者口令</label>
+            <input type="password" id="adminPwd" placeholder="请输入口令" autocomplete="off" />
+          </div>
+
+          <div class="admin-gate-actions">
+            <button class="btn btn-ghost" id="adminBack">返回汤库</button>
+            <button class="btn btn-primary" id="adminEnter">进入管理页</button>
+          </div>
+
+          <p class="upload-hint">
+            口令取自服务器环境变量 <code>ADMIN_PASSWORD</code>，未配置时本入口不可用。
+            连续输错 5 次会锁定 15 分钟；令牌有效期 2 小时，关闭标签页即失效。
+          </p>
+        </div>
+      </div>
+    `;
+
+    const input = document.getElementById('adminPwd');
+    const btn = document.getElementById('adminEnter');
+
+    const submit = async () => {
+      const pwd = input.value;
+      if (!pwd) { toast('请输入管理者口令', 'err'); return; }
+      btn.disabled = true;
+      btn.textContent = '验证中...';
+      try {
+        const r = await API.adminLogin(pwd);
+        API.setAdminToken(r.data.adminToken);
+        toast('验证通过');
+        return renderAdmin();
+      } catch (e) {
+        toast('验证失败：' + e.message, 'err');
+        input.value = '';
+        input.focus();
+        btn.disabled = false;
+        btn.textContent = '进入管理页';
+      }
+    };
+
+    document.getElementById('adminBack').addEventListener('click', () => goto('#/library'));
+    btn.addEventListener('click', submit);
+    input.addEventListener('keydown', (e) => { if (e.key === 'Enter') submit(); });
+    input.focus();
+  }
+
+  // 待上传文件队列（管理员确认后才真正上传，避免误拖入即入库）
+  let adminPendingFiles = [];
+  let adminDocPage = 1;
+  const ADMIN_DOC_PAGE_SIZE = 20;
+  const ADMIN_MAX_FILES = 50;
+  const ADMIN_MAX_FILE_BYTES = 8 * 1024 * 1024;
+
+  function fmtNumber(n) {
+    const v = Number(n) || 0;
+    return v.toLocaleString('zh-CN');
+  }
+
+  function fmtDateTime(s) {
+    if (!s) return '—';
+    const d = new Date(s);
+    if (isNaN(d.getTime())) return '—';
+    return d.toLocaleString('zh-CN', { hour12: false });
+  }
+
+  // 字符数（语料量）：按中文习惯用「字 / 万字」
+  function fmtChars(n) {
+    const v = Number(n) || 0;
+    if (v < 10000) return v.toLocaleString('zh-CN') + ' 字';
+    return (v / 10000).toFixed(v < 100000 ? 2 : 1) + ' 万字';
+  }
+
+  // 文件体积：按字节换算（待上传列表用，与「字符数」是两个概念，不能混用一个函数）
+  function fmtFileSize(bytes) {
+    const v = Number(bytes) || 0;
+    if (v < 1024) return v + ' B';
+    if (v < 1024 * 1024) return (v / 1024).toFixed(1) + ' KB';
+    return (v / 1024 / 1024).toFixed(2) + ' MB';
+  }
+
+  async function renderAdminPanel(stats, warn) {
+    const s = stats || {};
+    main.innerHTML = `
+      <div class="page">
+        <div class="page-head admin-head">
+          <div>
+            <h1 class="page-title">🛡️ 管理者入口</h1>
+            <p class="page-desc">上传海龟汤知识库文件，增强 AI 陪玩的判题能力（全站用户共享）</p>
+          </div>
+          <button class="btn btn-ghost" id="adminExit">退出管理</button>
+        </div>
+
+        ${warn ? `<div class="admin-alert err">${escapeHTML(warn)}</div>` : ''}
+
+        <div class="admin-stats">
+          <div class="admin-stat"><div class="admin-stat-num" id="stFiles">${fmtNumber(s.files)}</div><div class="admin-stat-label">已上传文件</div></div>
+          <div class="admin-stat"><div class="admin-stat-num" id="stBlocks">${fmtNumber(s.blocks)}</div><div class="admin-stat-label">知识单元</div></div>
+          <div class="admin-stat"><div class="admin-stat-num" id="stVectors">${fmtNumber(s.vectors)}</div><div class="admin-stat-label">向量条数</div></div>
+          <div class="admin-stat"><div class="admin-stat-num" id="stChars">${fmtChars(s.chars)}</div><div class="admin-stat-label">累计语料</div></div>
+        </div>
+
+        <div class="form-card">
+          <h3>📤 上传知识库文件</h3>
+          <p class="admin-desc">
+            支持一次拖入或选择多个 <code>.txt</code> 文件（单次最多 ${ADMIN_MAX_FILES} 个，单个不超过 8MB，
+            单次总大小不超过 50MB）。服务端会按「一题一块」结构化切分：识别
+            <code>汤名 / 汤面 / 汤底 / 推理逻辑</code> 等字段，以整道汤为一个检索单元；
+            内容相同的文件按 MD5 自动去重。
+            <br />示例格式：
+            <code class="admin-code">汤名：雪夜里的脚印
+汤面：一个人在雪地里留下两排脚印，却没有往回走的痕迹。
+汤底：他是被雪橇拉走的。
+推理逻辑：关键在只有两排脚印。</code>
+          </p>
+
+          <div class="admin-drop" id="adminDrop">
+            <div class="admin-drop-icon">📄</div>
+            <div class="admin-drop-text">把 txt 文件拖到这里，或 <span class="admin-drop-link">点击选择文件</span></div>
+            <div class="admin-drop-hint">仅支持 .txt；建议使用 UTF-8 编码（GBK 会自动识别）</div>
+            <input type="file" id="adminFileInput" accept=".txt,text/plain" multiple hidden />
+          </div>
+
+          <div class="admin-file-list" id="adminFileList"></div>
+
+          <div class="admin-upload-actions">
+            <button class="btn btn-ghost" id="adminClearFiles">清空待上传</button>
+            <button class="btn btn-primary" id="adminUploadBtn" disabled>开始上传</button>
+          </div>
+
+          <div class="admin-results" id="adminResults"></div>
+        </div>
+
+        <div class="form-card">
+          <h3>🔍 检索测试</h3>
+          <p class="admin-desc">
+            模拟玩家提问，看知识库会召回哪些内容。含真实相似度分数（本地 n-gram 向量是字面匹配，
+            分数偏低属正常）；低于门槛的条目会标为「未过门槛」，可用于校准门槛值。
+            当前门槛 <b id="adminMinScoreLabel">${s.minScore != null ? s.minScore : 0.08}</b>，Top-K <b>${s.topK != null ? s.topK : 4}</b>。
+          </p>
+          <div class="admin-search-row">
+            <input type="text" id="adminSearchInput" placeholder="例如：他是被雪橇拉走的吗" maxlength="500" />
+            <button class="btn btn-primary" id="adminSearchBtn">检索</button>
+          </div>
+          <div class="admin-results" id="adminSearchResults"></div>
+        </div>
+
+        <div class="form-card">
+          <h3>📚 已入库文件</h3>
+          <div id="adminDocTable"><div class="empty"><p>加载中...</p></div></div>
+          <div class="admin-doc-foot">
+            <button class="btn btn-danger btn-sm" id="adminReset">清空整个知识库</button>
+          </div>
+        </div>
+      </div>
+    `;
+
+    document.getElementById('adminExit').addEventListener('click', () => {
+      API.adminLogout();
+      toast('已退出管理模式');
+      goto('#/library');
+    });
+
+    /* ---------- 文件选择 / 拖拽 ---------- */
+    const dropEl = document.getElementById('adminDrop');
+    const fileInput = document.getElementById('adminFileInput');
+    const listEl = document.getElementById('adminFileList');
+    const uploadBtn = document.getElementById('adminUploadBtn');
+
+    function addFiles(fileList) {
+      const arr = Array.from(fileList || []);
+      let added = 0;
+      const rejected = [];
+      for (const f of arr) {
+        if (!/\.txt$/i.test(f.name)) { rejected.push(f.name + '（非 txt）'); continue; }
+        if (f.size > ADMIN_MAX_FILE_BYTES) { rejected.push(f.name + '（超过 8MB）'); continue; }
+        if (adminPendingFiles.some((x) => x.name === f.name && x.size === f.size)) continue;
+        if (adminPendingFiles.length >= ADMIN_MAX_FILES) { rejected.push(f.name + '（超出单次上限）'); continue; }
+        adminPendingFiles.push(f);
+        added++;
+      }
+      renderPendingFiles();
+      if (rejected.length) toast('已跳过：' + rejected.join('、'), 'err');
+      else if (added) toast(`已加入 ${added} 个文件，点击「开始上传」入库`);
+    }
+
+    function renderPendingFiles() {
+      if (!adminPendingFiles.length) {
+        listEl.innerHTML = '';
+        uploadBtn.disabled = true;
+        uploadBtn.textContent = '开始上传';
+        return;
+      }
+      const totalBytes = adminPendingFiles.reduce((n, f) => n + f.size, 0);
+      listEl.innerHTML =
+        `<div class="admin-file-list-head">待上传 ${adminPendingFiles.length} 个文件 · 合计 ${fmtFileSize(totalBytes)}</div>` +
+        adminPendingFiles.map((f, i) => `
+          <div class="admin-file-item">
+            <span class="admin-file-name">${escapeHTML(f.name)}</span>
+            <span class="admin-file-size">${fmtFileSize(f.size)}</span>
+            <button class="admin-file-del" data-idx="${i}" title="移除">✕</button>
+          </div>`).join('');
+      listEl.querySelectorAll('.admin-file-del').forEach((b) => {
+        b.addEventListener('click', () => {
+          adminPendingFiles.splice(Number(b.dataset.idx), 1);
+          renderPendingFiles();
+        });
+      });
+      uploadBtn.disabled = false;
+      uploadBtn.textContent = `开始上传（${adminPendingFiles.length} 个）`;
+    }
+
+    fileInput.addEventListener('change', () => {
+      addFiles(fileInput.files);
+      fileInput.value = '';
+    });
+    dropEl.addEventListener('click', () => fileInput.click());
+    ['dragenter', 'dragover'].forEach((ev) => {
+      dropEl.addEventListener(ev, (e) => { e.preventDefault(); dropEl.classList.add('dragging'); });
+    });
+    ['dragleave', 'drop'].forEach((ev) => {
+      dropEl.addEventListener(ev, (e) => { e.preventDefault(); dropEl.classList.remove('dragging'); });
+    });
+    dropEl.addEventListener('drop', (e) => {
+      if (e.dataTransfer && e.dataTransfer.files) addFiles(e.dataTransfer.files);
+    });
+
+    document.getElementById('adminClearFiles').addEventListener('click', () => {
+      adminPendingFiles = [];
+      renderPendingFiles();
+      document.getElementById('adminResults').innerHTML = '';
+    });
+
+    /* ---------- 上传 ---------- */
+    uploadBtn.addEventListener('click', async () => {
+      if (!adminPendingFiles.length) return;
+      const files = adminPendingFiles.slice();
+      uploadBtn.disabled = true;
+      uploadBtn.textContent = '上传中...';
+      const resEl = document.getElementById('adminResults');
+      resEl.innerHTML = `<div class="admin-result-line info">正在上传并解析 ${files.length} 个文件，请勿关闭页面...</div>`;
+      try {
+        const r = await API.adminUploadKnowledge(files);
+        renderUploadResults(r.data);
+        // 已处理的文件从未上传队列里移除（跳过/失败的也移除：重复上传不会有新结果）
+        adminPendingFiles = [];
+        renderPendingFiles();
+        await refreshAdminStats();
+        adminDocPage = 1;
+        await loadAdminDocuments();
+      } catch (e) {
+        resEl.innerHTML = `<div class="admin-result-line reject">上传失败：${escapeHTML(e.message)}</div>`;
+        uploadBtn.disabled = false;
+        uploadBtn.textContent = `开始上传（${adminPendingFiles.length} 个）`;
+      }
+    });
+
+    function renderUploadResults(data) {
+      const resEl = document.getElementById('adminResults');
+      if (!data || !Array.isArray(data.results)) { resEl.innerHTML = ''; return; }
+      const sum = data.summary || { ok: 0, skipped: 0, failed: 0 };
+      const head = `<div class="admin-result-line ${sum.failed ? 'reject' : 'ok'}">
+          共 ${data.results.length} 个文件：成功 ${sum.ok}，跳过 ${sum.skipped}，失败 ${sum.failed}
+        </div>`;
+      const rows = data.results.map((r) => {
+        const cls = r.status === 'ok' ? 'ok' : (r.status === 'skipped' ? 'skip' : 'reject');
+        const tail = r.status === 'ok'
+          ? `${r.blocks} 个知识单元 / ${r.chunks} 条向量 / ${fmtChars(r.chars)}`
+          : (r.message || '');
+        const enc = r.encoding ? ` <span class="admin-tag">${escapeHTML(r.encoding)}</span>` : '';
+        return `<div class="admin-result-line ${cls}">
+          <b>${escapeHTML(r.filename)}</b>${enc} — ${escapeHTML(tail)}
+        </div>`;
+      }).join('');
+      resEl.innerHTML = head + rows;
+    }
+
+    async function refreshAdminStats() {
+      try {
+        const r = await API.adminStats();
+        const d = r.data || {};
+        document.getElementById('stFiles').textContent = fmtNumber(d.files);
+        document.getElementById('stBlocks').textContent = fmtNumber(d.blocks);
+        document.getElementById('stVectors').textContent = fmtNumber(d.vectors);
+        document.getElementById('stChars').textContent = fmtChars(d.chars);
+      } catch (e) { /* 概览刷新失败不影响上传结果展示 */ }
+    }
+
+    /* ---------- 已入库文件列表 ---------- */
+    async function loadAdminDocuments() {
+      const box = document.getElementById('adminDocTable');
+      if (!box) return;
+      try {
+        const r = await API.adminListDocuments(adminDocPage, ADMIN_DOC_PAGE_SIZE);
+        const d = r.data || {};
+        const list = d.list || [];
+        if (!list.length) {
+          box.innerHTML = `<div class="empty"><p>知识库还是空的，先在上面上传一些 txt 吧</p></div>`;
+          return;
+        }
+        box.innerHTML = `
+          <div class="admin-table-wrap">
+            <table class="admin-table">
+              <thead><tr>
+                <th>文件名</th><th>知识单元</th><th>向量</th><th>语料量</th>
+                <th>编码</th><th>上传者</th><th>上传时间</th><th></th>
+              </tr></thead>
+              <tbody>
+                ${list.map((it) => `
+                  <tr>
+                    <td class="admin-td-name" title="${escapeHTML(it.filename)}">${escapeHTML(it.filename)}</td>
+                    <td>${fmtNumber(it.blocks)}</td>
+                    <td>${fmtNumber(it.chunks)}</td>
+                    <td>${fmtChars(it.chars)}</td>
+                    <td><span class="admin-tag">${escapeHTML(it.encoding || '—')}</span></td>
+                    <td>${escapeHTML(it.operator || '—')}</td>
+                    <td>${escapeHTML(fmtDateTime(it.createdAt))}</td>
+                    <td><button class="btn btn-danger btn-sm" data-del-doc="${it.id}">删除</button></td>
+                  </tr>`).join('')}
+              </tbody>
+            </table>
+          </div>
+          <div class="admin-pager">
+            <span class="pg-total">共 ${d.total} 个文件 · 第 ${d.page}/${d.totalPages} 页</span>
+            <button class="pg-btn" id="adminDocPrev" ${d.page <= 1 ? 'disabled' : ''}>上一页</button>
+            <button class="pg-btn" id="adminDocNext" ${d.page >= d.totalPages ? 'disabled' : ''}>下一页</button>
+          </div>
+        `;
+        const prev = document.getElementById('adminDocPrev');
+        const next = document.getElementById('adminDocNext');
+        if (prev) prev.addEventListener('click', () => { if (adminDocPage > 1) { adminDocPage--; loadAdminDocuments(); } });
+        if (next) next.addEventListener('click', () => { if (adminDocPage < d.totalPages) { adminDocPage++; loadAdminDocuments(); } });
+        box.querySelectorAll('[data-del-doc]').forEach((btn) => {
+          btn.addEventListener('click', () => deleteAdminDocument(btn.dataset.delDoc));
+        });
+      } catch (e) {
+        box.innerHTML = `<div class="empty"><p>加载失败：${escapeHTML(e.message)}</p></div>`;
+      }
+    }
+
+    async function deleteAdminDocument(id) {
+      const okDel = await showDialog({
+        title: '删除确认',
+        message: '删除后该文件的知识会从向量库中一并移除，AI 陪玩将不再引用它。此操作不可撤销。',
+        confirmText: '删除',
+        cancelText: '取消',
+        showCancel: true,
+      });
+      if (!okDel) return;
+      try {
+        const r = await API.adminDeleteDocument(id);
+        toast(r.message || '已删除');
+        await refreshAdminStats();
+        await loadAdminDocuments();
+      } catch (e) {
+        toast('删除失败：' + e.message, 'err');
+      }
+    }
+
+    /* ---------- 清空知识库 ---------- */
+    document.getElementById('adminReset').addEventListener('click', async () => {
+      const first = await showDialog({
+        title: '危险操作',
+        message: '这会删除知识库中的全部文件与向量，AI 陪玩将失去知识库增强。确定继续吗？',
+        confirmText: '继续',
+        cancelText: '取消',
+        showCancel: true,
+      });
+      if (!first) return;
+      const typed = await showDialog({
+        title: '二次确认',
+        message: '请输入「清空知识库」以确认。此操作不可撤销。',
+        confirmText: '确认清空',
+        cancelText: '取消',
+        showCancel: true,
+      });
+      if (!typed) return;
+      try {
+        const r = await API.adminResetKnowledge('清空知识库');
+        toast(r.message || '已清空');
+        document.getElementById('adminResults').innerHTML = '';
+        await refreshAdminStats();
+        adminDocPage = 1;
+        await loadAdminDocuments();
+      } catch (e) {
+        toast('清空失败：' + e.message, 'err');
+      }
+    });
+
+    /* ---------- 检索测试 ---------- */
+    const searchInput = document.getElementById('adminSearchInput');
+    const searchBtn = document.getElementById('adminSearchBtn');
+    const searchRes = document.getElementById('adminSearchResults');
+
+    const doSearch = async () => {
+      const question = searchInput.value.trim();
+      if (!question) { toast('请输入测试问题', 'err'); return; }
+      searchBtn.disabled = true;
+      searchBtn.textContent = '检索中...';
+      try {
+        const r = await API.adminSearchKnowledge({ question });
+        const d = r.data || {};
+        const hits = d.hits || [];
+        if (!hits.length) {
+          searchRes.innerHTML = `<div class="admin-result-line skip">知识库为空，没有任何召回结果</div>`;
+        } else {
+          searchRes.innerHTML = hits.map((h, i) => `
+            <div class="admin-hit ${h.pass ? 'pass' : 'miss'}">
+              <div class="admin-hit-head">
+                <span class="admin-hit-score">${h.score.toFixed(3)}</span>
+                <span class="admin-hit-title">${escapeHTML(h.title || '（无题名）')}</span>
+                <span class="admin-hit-file">${escapeHTML(h.filename)}</span>
+                ${h.pass ? '' : '<span class="admin-hit-flag">未过门槛</span>'}
+              </div>
+              <div class="admin-hit-text">${escapeHTML(h.text)}</div>
+            </div>`).join('');
+        }
+      } catch (e) {
+        searchRes.innerHTML = `<div class="admin-result-line reject">检索失败：${escapeHTML(e.message)}</div>`;
+      } finally {
+        searchBtn.disabled = false;
+        searchBtn.textContent = '检索';
+      }
+    };
+    searchBtn.addEventListener('click', doSearch);
+    searchInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') doSearch(); });
+
+    await loadAdminDocuments();
+  }
+
   // ==================== 退出登录 ====================
   document.getElementById('logoutBtn').addEventListener('click', async () => {
     try { await API.logout(); } catch (e) {}
@@ -1685,6 +2161,15 @@
   // 点击左下角用户信息 → 进入个人设置（修改 AI 接口配置）
   document.getElementById('userChip').addEventListener('click', () => {
     goto('#/settings');
+  });
+
+  // 管理者入口：已在管理页时再点该导航项，hash 没变化不会触发 hashchange，
+  // 必须手动重渲染一次（与项目「内部跳转统一走 goto」的约定同源）
+  document.getElementById('adminNav').addEventListener('click', (e) => {
+    if (location.hash === '#/admin') {
+      e.preventDefault();
+      navigate();
+    }
   });
 
   // ==================== 工具：HTML 转义 ====================

@@ -14,8 +14,14 @@
 const fs = require('fs');
 const path = require('path');
 
-const DATA_DIR = path.join(__dirname, 'data', 'chroma');
+const DATA_DIR_DEFAULT = path.join(__dirname, 'data', 'chroma');
 const DIM = 1024; // 嵌入向量维度（1024 维显著降低短文本的哈希碰撞噪声）
+
+// 落盘目录允许用环境变量覆盖（数据隔离），与 annotation-store.js 的 ANNOTATIONS_DIR 同一套约定。
+// 必须在【每次访问时】解析，不能在模块加载时固化成常量，否则运行期改 env 不生效（测试就用不了隔离目录）。
+function dataDir() {
+  return process.env.CHROMA_DIR || DATA_DIR_DEFAULT;
+}
 
 // ==================== 本地嵌入：字符 unigram + bigram 哈希 ====================
 // FNV-1a 32 位哈希，把每个字符/二元组映射到固定维度
@@ -64,7 +70,7 @@ const collections = new Map();
 
 function colPath(name) {
   const safe = String(name).replace(/[^\w-]/g, ''); // 防路径穿越
-  return path.join(DATA_DIR, safe + '.json');
+  return path.join(dataDir(), safe + '.json');
 }
 
 function getCollection(name) {
@@ -84,7 +90,7 @@ function getCollection(name) {
 // 持久化：写临时文件再原子替换，避免写一半损坏
 function persist(col) {
   try {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.mkdirSync(dataDir(), { recursive: true });
     const snapshot = {
       name: col.name,
       embedding: col.embedding,

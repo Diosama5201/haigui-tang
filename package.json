@@ -5,9 +5,11 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test": "node tests/offline-engine.test.js && node tests/annotation-store.test.js",
+    "test": "node tests/offline-engine.test.js && node tests/annotation-store.test.js && node tests/knowledge-base.test.js && node tests/upload-utils.test.js",
     "test:engine": "node tests/offline-engine.test.js",
     "test:annotations": "node tests/annotation-store.test.js",
+    "test:kb": "node tests/knowledge-base.test.js",
+    "test:upload": "node tests/upload-utils.test.js",
     "eval:annotations": "node tests/annotations.run.js",
     "import:puzzles": "node tools/import-puzzles.js"
   },

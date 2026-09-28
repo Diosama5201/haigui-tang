@@ -23,6 +23,12 @@
   --radius: 14px;
   --radius-lg: 20px;
   --font: "PingFang SC", "Microsoft YaHei", "Segoe UI", system-ui, sans-serif;
+
+  /* 语义色（管理者页面与各类状态提示共用；亮色为默认）
+     这些是「有语义的颜色」，必须成对提供暗色版本，否则关灯后文字读不了 */
+  --ok-bg: #e6f4ea;    --ok-line: #a8d5b5;   --ok-text: #2f6b45;
+  --warn-bg: #fdf4e3;  --warn-line: #e8cf9a; --warn-text: #8a6320;
+  --err-bg: #fdecea;   --err-line: #e8b4af;  --err-text: #9c4038;
 }
 
 * {
@@ -1224,6 +1230,9 @@ html[data-theme='dark'] {
   --line: #243350;
   --shadow: 0 6px 24px rgba(0, 0, 0, .35);
   --shadow-lg: 0 12px 40px rgba(0, 0, 0, .5);
+  --ok-bg: #10291f;    --ok-line: #2b6b4c;   --ok-text: #7fe0b6;
+  --warn-bg: #2c2413;  --warn-line: #6b5726; --warn-text: #f0cf8a;
+  --err-bg: #2c1614;   --err-line: #7a3a33;  --err-text: #f0a79f;
 }
 html[data-theme='dark'] body,
 html[data-theme='dark'] .main {
@@ -1580,4 +1589,351 @@ html[data-theme='dark'] .theme-icon {
   .drip { animation: none; height: var(--h); opacity: .45; }
   .drip::after { display: none; }
   .horror-skull { animation: none; }
+}
+
+/* =========================================================
+   管理者入口（RAG 知识库）
+   —— 侧边栏导航项 + 口令门禁 + 上传/检索/文件管理
+   颜色一律走 CSS 变量（--green-* / --ink-* / --ok-* / --warn-* / --err-*）
+   ========================================================= */
+
+/* ---------- 侧边栏导航项：推到底部，与普通功能项区分 ---------- */
+.nav-item-admin {
+  margin-top: auto;                 /* 在 .sidebar-nav（flex:1 纵向）里沉到底部 */
+  border: 1px dashed var(--green-300);
+  background: var(--green-50);
+  font-size: 14px;
+}
+.nav-item-admin:hover {
+  border-style: solid;
+  border-color: var(--green-400);
+}
+.nav-item-admin.active {
+  border-style: solid;
+  border-color: var(--green-500);
+  background: var(--green-100);
+  color: var(--green-700);
+}
+
+/* ---------- 页面头部：标题 + 退出管理按钮 ---------- */
+.admin-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+/* ---------- 口令门禁 ---------- */
+.admin-gate {
+  max-width: 560px;
+  text-align: left;
+}
+.admin-gate-icon {
+  font-size: 40px;
+  line-height: 1;
+  margin-bottom: 8px;
+}
+.admin-gate h3 { margin-bottom: 10px; }
+.admin-gate-desc {
+  font-size: 14px;
+  color: var(--ink-soft);
+  line-height: 1.9;
+  margin-bottom: 18px;
+}
+.admin-gate-desc strong { color: var(--green-700); }
+.admin-gate-actions {
+  display: flex;
+  gap: 12px;
+  justify-content: flex-end;
+  margin-top: 6px;
+}
+
+/* ---------- 通用状态提示条 ---------- */
+.admin-alert {
+  border-radius: var(--radius);
+  padding: 12px 16px;
+  font-size: 14px;
+  line-height: 1.7;
+  margin-bottom: 16px;
+  border: 1px solid var(--line);
+  background: var(--green-50);
+  color: var(--ink-soft);
+}
+.admin-alert.err {
+  background: var(--err-bg);
+  border-color: var(--err-line);
+  color: var(--err-text);
+}
+
+/* ---------- 统计卡片 ---------- */
+.admin-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 14px;
+  margin-bottom: 20px;
+}
+.admin-stat {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 16px 18px;
+  box-shadow: var(--shadow);
+}
+.admin-stat-num {
+  font-size: 24px;
+  font-weight: 700;
+  color: var(--green-700);
+  line-height: 1.3;
+  word-break: break-all;
+}
+.admin-stat-label {
+  font-size: 13px;
+  color: var(--ink-faint);
+  margin-top: 4px;
+}
+
+/* ---------- 说明文字与代码示例 ---------- */
+.admin-desc {
+  font-size: 14px;
+  color: var(--ink-soft);
+  line-height: 1.9;
+  margin-bottom: 16px;
+}
+.admin-desc code,
+.admin-gate .upload-hint code {
+  background: var(--green-100);
+  color: var(--green-700);
+  padding: 2px 6px;
+  border-radius: 5px;
+  font-size: 13px;
+}
+.admin-code {
+  display: block;
+  white-space: pre-wrap;
+  margin-top: 10px;
+  padding: 12px 14px;
+  line-height: 1.9;
+}
+
+/* ---------- 拖拽上传区 ---------- */
+.admin-drop {
+  border: 2px dashed var(--green-300);
+  border-radius: var(--radius);
+  background: var(--green-50);
+  padding: 26px 20px;
+  text-align: center;
+  transition: background .2s, border-color .2s;
+}
+.admin-drop:hover { background: var(--green-100); }
+.admin-drop.dragging {
+  border-color: var(--green-500);
+  background: var(--green-100);
+}
+.admin-drop-icon { font-size: 30px; line-height: 1; margin-bottom: 8px; }
+.admin-drop-text { font-size: 15px; color: var(--ink); }
+.admin-drop-link { color: var(--green-700); font-weight: 600; text-decoration: underline; }
+.admin-drop-hint { font-size: 13px; color: var(--ink-faint); margin-top: 6px; }
+
+/* ---------- 待上传文件列表 ---------- */
+.admin-file-list { margin-top: 14px; }
+.admin-file-list-head {
+  font-size: 13px;
+  color: var(--ink-soft);
+  margin-bottom: 8px;
+}
+.admin-file-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--card);
+  margin-bottom: 6px;
+  font-size: 14px;
+}
+.admin-file-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.admin-file-size { color: var(--ink-faint); font-size: 13px; flex-shrink: 0; }
+.admin-file-del {
+  border: none;
+  background: transparent;
+  color: var(--ink-faint);
+  font-size: 15px;
+  line-height: 1;
+  padding: 4px 6px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.admin-file-del:hover { background: var(--err-bg); color: var(--err-text); }
+
+.admin-upload-actions {
+  display: flex;
+  gap: 12px;
+  justify-content: flex-end;
+  margin-top: 16px;
+}
+
+/* ---------- 上传 / 检索结果 ---------- */
+.admin-results { margin-top: 16px; }
+.admin-result-line {
+  border-radius: 10px;
+  padding: 10px 14px;
+  font-size: 14px;
+  line-height: 1.8;
+  margin-bottom: 6px;
+  border: 1px solid var(--line);
+  background: var(--green-50);
+  color: var(--ink-soft);
+  word-break: break-all;
+}
+.admin-result-line.ok     { background: var(--ok-bg);   border-color: var(--ok-line);   color: var(--ok-text); }
+.admin-result-line.skip   { background: var(--warn-bg); border-color: var(--warn-line); color: var(--warn-text); }
+.admin-result-line.reject { background: var(--err-bg);  border-color: var(--err-line);  color: var(--err-text); }
+.admin-result-line.info   { background: var(--green-50); color: var(--ink-soft); }
+.admin-result-line b { font-weight: 600; }
+
+.admin-tag {
+  display: inline-block;
+  font-size: 12px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: var(--green-100);
+  color: var(--green-700);
+  border: 1px solid var(--green-200);
+}
+
+/* ---------- 检索测试 ---------- */
+.admin-search-row {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+}
+.admin-search-row input {
+  flex: 1;
+  min-width: 0;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--card);
+  color: var(--ink);
+  font-size: 15px;
+  font-family: var(--font);
+}
+.admin-search-row input:focus {
+  outline: none;
+  border-color: var(--green-400);
+  box-shadow: 0 0 0 3px var(--green-100);
+}
+
+.admin-hit {
+  border: 1px solid var(--line);
+  border-left-width: 4px;
+  border-radius: 10px;
+  padding: 12px 14px;
+  margin-bottom: 10px;
+  background: var(--card);
+}
+.admin-hit.pass { border-left-color: var(--ok-line); }
+.admin-hit.miss { border-left-color: var(--warn-line); opacity: .85; }
+.admin-hit-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  font-size: 13px;
+  margin-bottom: 8px;
+}
+.admin-hit-score {
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: var(--green-700);
+  background: var(--green-100);
+  border-radius: 6px;
+  padding: 2px 8px;
+}
+.admin-hit.miss .admin-hit-score { color: var(--warn-text); background: var(--warn-bg); }
+.admin-hit-title { font-weight: 600; color: var(--ink); }
+.admin-hit-file { color: var(--ink-faint); }
+.admin-hit-flag {
+  font-size: 12px;
+  color: var(--warn-text);
+  background: var(--warn-bg);
+  border: 1px solid var(--warn-line);
+  border-radius: 999px;
+  padding: 1px 8px;
+}
+.admin-hit-text {
+  font-size: 13px;
+  color: var(--ink-soft);
+  line-height: 1.85;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 180px;
+  overflow: auto;
+  background: var(--green-50);
+  border-radius: 8px;
+  padding: 10px 12px;
+}
+
+/* ---------- 已入库文件表格 ---------- */
+.admin-table-wrap { overflow-x: auto; }
+.admin-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 14px;
+}
+.admin-table th {
+  text-align: left;
+  font-weight: 600;
+  font-size: 13px;
+  color: var(--ink-soft);
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--line);
+  white-space: nowrap;
+}
+.admin-table td {
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--line);
+  color: var(--ink);
+  vertical-align: middle;
+}
+.admin-table tbody tr:hover { background: var(--green-50); }
+.admin-td-name {
+  max-width: 260px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.admin-pager {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 14px;
+  font-size: 14px;
+  color: var(--ink-soft);
+  flex-wrap: wrap;
+}
+.admin-doc-foot {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 18px;
+  padding-top: 16px;
+  border-top: 1px solid var(--line);
+}
+
+/* ---------- 小屏适配 ---------- */
+@media (max-width: 640px) {
+  .admin-head { flex-direction: column; }
+  .admin-search-row { flex-direction: column; align-items: stretch; }
+  .admin-upload-actions,
+  .admin-gate-actions { justify-content: stretch; }
+  .admin-upload-actions .btn,
+  .admin-gate-actions .btn { flex: 1; }
 }

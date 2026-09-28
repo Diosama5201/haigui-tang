@@ -10,11 +10,30 @@ const path = require('path');
 const crypto = require('crypto');
 const mysql = require('mysql2/promise');
 const chroma = require('./vector-store'); // 内嵌 Chroma 风格向量库
+const knowledgeBase = require('./knowledge-base'); // 管理者知识库（RAG 第二层：汤面 / 汤底 / 推理逻辑）
+const { parseMultipart, parseBoundary, sanitizeFilename, decodeTextBuffer } = require('./upload-utils'); // 上传字节级工具
 const { parseProgressFromText, estimateProgressLocally } = require('./progress-utils'); // 进度智能体纯函数工具
 const offlineEngine = require('./offline-engine'); // 内置离线推理引擎
 
 // 向量库 collection 名称（汤类知识库统一存这里）
 const VECTOR_COLLECTION = 'haigui_soups';
+
+// 管理者口令：**只从环境变量读取，代码里不留任何默认值**。
+// 本仓库是公开仓库，把口令写进源码等于对外公开；因此未配置时管理入口整体不可用（返回 503），
+// 其余功能完全不受影响。配置方式见 README「管理者入口」一节。
+// ⚠️ 变量本身必须在下方 loadEnv() 执行**之后**读取，否则本地 .env 里配的口令不会生效。
+const ADMIN_TOKEN_EXPIRE = 2 * 60 * 60 * 1000; // 管理令牌 2 小时，短于普通登录令牌的 7 天
+// 口令失败限流：同一 IP 15 分钟内连续失败 5 次即锁定到窗口结束
+const ADMIN_FAIL_WINDOW = 15 * 60 * 1000;
+const ADMIN_MAX_FAILS = 5;
+
+// 请求体上限：普通 JSON 接口沿用 10MB；管理页批量上传 txt 放宽到 50MB
+const MAX_JSON_BODY = 10 * 1024 * 1024;
+const MAX_KB_BODY = 50 * 1024 * 1024;
+// 单次上传的文件个数与单文件大小上限（防一次性灌爆内存）
+const KB_MAX_FILES = 50;
+const KB_MAX_FILE_BYTES = 8 * 1024 * 1024;
+const KB_MAX_FILE_CHARS = 2 * 1024 * 1024;
 
 // ==================== 加载 .env（若存在，不覆盖已有环境变量） ====================
 (function loadEnv() {
@@ -40,6 +59,10 @@ const VECTOR_COLLECTION = 'haigui_soups';
 const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || 'haigui-tang-secret-please-change-in-prod';
 const TOKEN_EXPIRE = 7 * 24 * 60 * 60 * 1000; // 7 天
+
+// 管理者口令（必须在 loadEnv() 之后读取，见文件上方说明）。
+// 未配置 → 管理入口返回 503 并给出明确指引，而不是静默放行或崩溃。
+const ADMIN_PASSWORD = String(process.env.ADMIN_PASSWORD || '');
 
 // MySQL 连接配置（通过环境变量注入，禁止硬编码）
 const DB_CONFIG = {
@@ -107,9 +130,9 @@ function base64url(str) {
 function base64urlDecode(str) {
   return Buffer.from(str, 'base64url').toString('utf8');
 }
-function signToken(payload) {
+function signToken(payload, ttlMs) {
   const header = { alg: 'HS256', typ: 'JWT' };
-  const body = { ...payload, exp: Date.now() + TOKEN_EXPIRE };
+  const body = { ...payload, exp: Date.now() + (ttlMs || TOKEN_EXPIRE) };
   const h = base64url(JSON.stringify(header));
   const b = base64url(JSON.stringify(body));
   const sig = crypto.createHmac('sha256', JWT_SECRET).update(h + '.' + b).digest('base64url');
@@ -231,6 +254,26 @@ async function initDatabase() {
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
   `);
 
+  // 知识库上传台账（RAG 第二层）：一行 = 一次成功入库的文件
+  //   md5 唯一键 = 内容指纹去重（参考项目用 md5.text 文件实现，本项目按约定改为入库）
+  //   向量本体在 vector-store 的 haigui_kb collection，本表只存可查询的元数据
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS kb_documents (
+      id            VARCHAR(36)  PRIMARY KEY,
+      filename      VARCHAR(255) NOT NULL,
+      md5           CHAR(32)     NOT NULL,
+      blocks        INT          NOT NULL DEFAULT 0,
+      chunks        INT          NOT NULL DEFAULT 0,
+      chars         INT          NOT NULL DEFAULT 0,
+      encoding      VARCHAR(30)  NOT NULL DEFAULT '',
+      operator_id   VARCHAR(36)  NOT NULL,
+      operator_name VARCHAR(50)  NOT NULL,
+      created_at    DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE KEY uk_md5 (md5),
+      INDEX idx_created (created_at)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+  `);
+
   console.log(`✅ 数据库已就绪: ${database}@${DB_CONFIG.host}:${DB_CONFIG.port}`);
 }
 
@@ -240,13 +283,20 @@ function sendJSON(res, status, obj) {
   res.end(JSON.stringify(obj));
 }
 
-function readBody(req) {
+/**
+ * 读取请求体。
+ * @param {number} [maxBytes] 上限，缺省 10MB；管理页批量上传 txt 时放宽到 MAX_KB_BODY
+ * @returns {Promise<Buffer>} 原始字节（二进制安全，调用方自行决定编码）
+ */
+function readBody(req, maxBytes) {
+  const limit = typeof maxBytes === 'number' && maxBytes > 0 ? maxBytes : MAX_JSON_BODY;
   return new Promise((resolve, reject) => {
     const chunks = [];
+    let total = 0;
     req.on('data', (chunk) => {
       chunks.push(chunk);
-      const total = chunks.reduce((n, c) => n + c.length, 0);
-      if (total > 10 * 1024 * 1024) {
+      total += chunk.length;
+      if (total > limit) {
         reject(new Error('body too large'));
         req.destroy();
       }
@@ -258,6 +308,62 @@ function readBody(req) {
 
 function bodyToText(buf) {
   return buf.toString('utf8');
+}
+
+/**
+ * 二进制安全的 multipart 解析、文件名净化、上传文本编码识别
+ * 三者均已抽到 upload-utils.js（可单测），此处仅保留引用。
+ * 见文件顶部的 require 与 tests/upload-utils.test.js。
+ */
+
+/* ==================== 管理者口令校验辅助 ==================== */
+
+/** 定长比较：先各自 SHA256 再比，避免长度差异带来的信息泄露 */
+function safeEqual(a, b) {
+  const ha = crypto.createHash('sha256').update(String(a), 'utf8').digest();
+  const hb = crypto.createHash('sha256').update(String(b), 'utf8').digest();
+  return crypto.timingSafeEqual(ha, hb);
+}
+
+function clientIP(req) {
+  return (req.socket && req.socket.remoteAddress) || 'unknown';
+}
+
+// 口令失败计数：ip -> { count, firstAt, lockedUntil }
+const adminFails = new Map();
+
+function adminLockRemainMs(ip) {
+  const r = adminFails.get(ip);
+  if (!r || !r.lockedUntil) return 0;
+  const remain = r.lockedUntil - Date.now();
+  return remain > 0 ? remain : 0;
+}
+
+function adminRecordFail(ip) {
+  const now = Date.now();
+  let r = adminFails.get(ip);
+  if (!r || now - r.firstAt > ADMIN_FAIL_WINDOW) r = { count: 0, firstAt: now, lockedUntil: 0 };
+  r.count++;
+  if (r.count >= ADMIN_MAX_FAILS) r.lockedUntil = r.firstAt + ADMIN_FAIL_WINDOW;
+  adminFails.set(ip, r);
+}
+
+function adminClearFails(ip) {
+  adminFails.delete(ip);
+}
+
+/**
+ * 校验管理令牌（请求头 X-Admin-Token）。
+ * 与用户登录令牌共用同一套 HMAC 签名，但额外要求 payload.role === 'admin'，
+ * 因此普通用户的令牌无法访问管理接口。
+ * @returns {null|object} 令牌 payload
+ */
+function requireAdminToken(req) {
+  const raw = req.headers['x-admin-token'];
+  if (!raw || typeof raw !== 'string') return null;
+  const payload = verifyToken(raw);
+  if (!payload || payload.role !== 'admin') return null;
+  return payload;
 }
 
 function parseCookies(req) {
@@ -344,7 +450,15 @@ const server = http.createServer(async (req, res) => {
     // 健康检查
     if (method === 'GET' && pathname === '/healthz') {
       const dbOk = pool ? 'ok' : 'down';
-      return sendJSON(res, 200, { code: 0, status: 'ok', db: dbOk, uptime: process.uptime() });
+      let kbVectors = null;
+      try { kbVectors = knowledgeBase.count(); } catch (e) { kbVectors = null; }
+      return sendJSON(res, 200, {
+        code: 0,
+        status: 'ok',
+        db: dbOk,
+        uptime: process.uptime(),
+        kb: { collection: knowledgeBase.KB_COLLECTION, vectors: kbVectors, adminEnabled: !!ADMIN_PASSWORD },
+      });
     }
 
     // 鉴权接口（无需登录）
@@ -424,6 +538,44 @@ const server = http.createServer(async (req, res) => {
       }
       if (method === 'GET' && /^\/api\/ai\/save\/[\w-]+$/.test(pathname)) {
         return await handleAIGetSave(req, res, pathname.split('/').pop());
+      }
+    }
+
+    // ---------- 管理者接口（需登录 + 管理者口令换取的令牌） ----------
+    // 所有 /api/admin/* 的失败响应都带 admin:true 标记，
+    // 前端据此区分「登录态过期」与「管理口令失效」，不会把用户踢出登录。
+    if (pathname.startsWith('/api/admin/')) {
+      const user = getAuthUser(req);
+      if (!user) return sendJSON(res, 401, { code: 401, admin: true, message: '未登录，请先登录' });
+      req.authUser = user; // 与 /api/ai/ 同样的约定：鉴权后立刻挂上，否则下游读 uid 会抛错
+
+      // 口令校验（换取 2 小时有效的管理令牌），本身不需要管理令牌
+      if (method === 'POST' && pathname === '/api/admin/login') {
+        return await handleAdminLogin(req, res);
+      }
+
+      // 其余接口一律要求管理令牌
+      if (!requireAdminToken(req)) {
+        return sendJSON(res, 403, { code: 403, admin: true, message: '管理者身份已失效，请重新验证口令' });
+      }
+
+      if (method === 'GET' && pathname === '/api/admin/kb/stats') {
+        return await handleAdminKbStats(req, res);
+      }
+      if (method === 'GET' && pathname === '/api/admin/kb/documents') {
+        return await handleAdminKbDocuments(req, res, url);
+      }
+      if (method === 'POST' && pathname === '/api/admin/kb/upload') {
+        return await handleAdminKbUpload(req, res);
+      }
+      if (method === 'POST' && pathname === '/api/admin/kb/search') {
+        return await handleAdminKbSearch(req, res);
+      }
+      if (method === 'POST' && pathname === '/api/admin/kb/reset') {
+        return await handleAdminKbReset(req, res);
+      }
+      if (method === 'DELETE' && /^\/api\/admin\/kb\/documents\/[\w-]+$/.test(pathname)) {
+        return await handleAdminKbDeleteDocument(req, res, pathname.split('/').pop());
       }
     }
 
@@ -730,39 +882,30 @@ async function handleUpdateSoup(req, res, id) {
 // ==================== txt 文件上传（解析为汤面+汤底） ====================
 async function handleUpload(req, res) {
   const contentType = req.headers['content-type'] || '';
-  if (!contentType.includes('multipart/form-data')) {
+  const boundary = parseBoundary(contentType);
+  if (!contentType.includes('multipart/form-data') || !boundary) {
     return sendJSON(res, 400, { code: 400, message: '请以 multipart/form-data 上传文件' });
   }
-  const boundary = contentType.split('boundary=')[1];
-  if (!boundary) return sendJSON(res, 400, { code: 400, message: '缺少 boundary' });
 
-  const raw = bodyToText(await readBody(req));
-  const parts = raw.split(`--${boundary}`);
-  let filename = '';
-  let fileContent = '';
-  for (const part of parts) {
-    if (!part.includes('Content-Disposition')) continue;
-    const headerEnd = part.indexOf('\r\n\r\n');
-    if (headerEnd === -1) continue;
-    const header = part.slice(0, headerEnd);
-    const body = part.slice(headerEnd + 4).replace(/\r\n$/, '');
-    const fileMatch = header.match(/filename="([^"]*)"/);
-    if (fileMatch) {
-      filename = fileMatch[1];
-      fileContent = body;
-    }
-  }
+  // 二进制安全解析：旧实现先把整个请求体 toString('utf8') 再按 boundary 切字符串，
+  // GBK 编码的 txt 会在这一步被解成乱码（解出来再切，边界也会被污染）
+  const buf = await readBody(req);
+  const filePart = parseMultipart(buf, boundary).find((p) => p.filename);
+  if (!filePart) return sendJSON(res, 400, { code: 400, message: '未检测到文件内容' });
 
-  if (!filename || !fileContent) return sendJSON(res, 400, { code: 400, message: '未检测到文件内容' });
+  const filename = sanitizeFilename(filePart.filename);
   const ext = path.extname(filename).toLowerCase();
   if (ext !== '.txt') return sendJSON(res, 400, { code: 400, message: '仅支持 .txt 格式的文件' });
 
-  // 保存原始文件
+  // 编码识别（UTF-8 / UTF-8 BOM / GBK），避免 Windows 记事本「ANSI」txt 整篇乱码
+  const decoded = decodeTextBuffer(filePart.body);
+
+  // 保存原始文件：直接落原始字节，不做编码转换，便于事后追溯
   fs.mkdirSync(UPLOAD_DIR, { recursive: true });
-  fs.writeFileSync(path.join(UPLOAD_DIR, `${crypto.randomUUID()}${ext}`), fileContent, 'utf8');
+  fs.writeFileSync(path.join(UPLOAD_DIR, `${crypto.randomUUID()}${ext}`), filePart.body);
 
   // 解析文本
-  const content = fileContent.replace(/\r\n/g, '\n').trim();
+  const content = knowledgeBase.normalizeText(decoded.text);
   let face = content;
   let bottom = '';
   let title = '';
@@ -782,7 +925,11 @@ async function handleUpload(req, res) {
   }
   face = face.replace(/^(汤面|谜面)\s*[:：]\s*/i, '').trim();
 
-  return sendJSON(res, 200, { code: 0, message: '上传成功，已解析', data: { title, face, bottom, filename } });
+  return sendJSON(res, 200, {
+    code: 0,
+    message: '上传成功，已解析',
+    data: { title, face, bottom, filename, encoding: decoded.encoding },
+  });
 }
 
 // ==================== 封面图上传（原始字节流，魔数校验） ====================
@@ -1166,8 +1313,22 @@ async function handleAIAsk(req, res) {
       console.error('vector retrieval error:', e.message);
     }
 
+    // —— 知识库检索（管理者上传的汤面 / 汤底 / 推理逻辑，全站共享）——
+    // 与上面的题库检索相互独立：知识库为空或检索异常都不影响主流程。
+    // 因为检索与注入都发生在服务端，用户各自配置的大模型自动共享同一份知识库，用户侧零配置。
+    let kbBlock = '';
+    try {
+      const kbHits = knowledgeBase.search(question, { n: knowledgeBase.DEFAULT_TOP_K });
+      if (kbHits.length) {
+        kbBlock = knowledgeBase.buildContextBlock(kbHits, '海龟汤知识库参考');
+        console.log(`[kb] 命中 ${kbHits.length} 条，最高分 ${kbHits[0].score.toFixed(3)}`);
+      }
+    } catch (e) {
+      console.error('knowledge base retrieval error:', e.message);
+    }
+
     // —— 汤主回答（原逻辑不变，仅追加了检索参考上下文）——
-    const sysPrompt = buildHostPrompt(face, bottom) + contextBlock;
+    const sysPrompt = buildHostPrompt(face, bottom) + contextBlock + kbBlock;
     const messages = [
       { role: 'system', content: sysPrompt },
       ...buildMessages(Array.isArray(history) ? history : []),
@@ -1471,6 +1632,372 @@ async function handleAIShorten(req, res) {  const payload = safeJSON(bodyToText(
     console.error('ai shorten error:', e.message);
     // 删减失败降级返回原汤面
     return sendJSON(res, 200, { code: 0, data: { face, degraded: true } });
+  }
+}
+
+// ==================== 管理者：口令校验 ====================
+// 设计要点：
+//   1. 口令只从环境变量 ADMIN_PASSWORD 读取，未配置则整体返回 503（不静默放行）
+//   2. 同一 IP 连续失败 5 次锁定 15 分钟，抵御口令爆破
+//   3. 失败日志只记录 IP 与用户名，绝不打印口令本身
+//   4. 失败返回 401 而非 200+错误码，但带 admin:true，前端不会误判成「登录过期」
+async function handleAdminLogin(req, res) {
+  if (!ADMIN_PASSWORD) {
+    return sendJSON(res, 503, {
+      code: 503,
+      admin: true,
+      message: '管理者入口未启用：服务器未配置 ADMIN_PASSWORD 环境变量（见 README「管理者入口」）',
+    });
+  }
+
+  const ip = clientIP(req);
+  const lockedMs = adminLockRemainMs(ip);
+  if (lockedMs > 0) {
+    return sendJSON(res, 429, {
+      code: 429,
+      admin: true,
+      message: `口令错误次数过多，请 ${Math.ceil(lockedMs / 60000)} 分钟后再试`,
+    });
+  }
+
+  const payload = safeJSON(bodyToText(await readBody(req)));
+  if (payload === null) return sendJSON(res, 400, { code: 400, admin: true, message: '请求格式错误' });
+
+  const password = String(payload.password || '');
+  if (!password) return sendJSON(res, 400, { code: 400, admin: true, message: '请输入管理者口令' });
+
+  if (!safeEqual(password, ADMIN_PASSWORD)) {
+    adminRecordFail(ip);
+    const r = adminFails.get(ip);
+    console.warn(`[admin] 口令校验失败 ip=${ip} user=${req.authUser.username} 连续失败=${r ? r.count : 1}`);
+    return sendJSON(res, 401, { code: 401, admin: true, message: '口令不正确' });
+  }
+
+  adminClearFails(ip);
+  const adminToken = signToken(
+    { uid: req.authUser.uid, username: req.authUser.username, role: 'admin' },
+    ADMIN_TOKEN_EXPIRE
+  );
+  console.log(`[admin] 口令校验通过 user=${req.authUser.username} ip=${ip}`);
+  return sendJSON(res, 200, {
+    code: 0,
+    message: '验证通过',
+    data: { adminToken, expiresIn: ADMIN_TOKEN_EXPIRE, username: req.authUser.username },
+  });
+}
+
+// ==================== 管理者：知识库概览 ====================
+async function handleAdminKbStats(req, res) {
+  if (!pool) return dbNotReady(res);
+  try {
+    const [rows] = await pool.query(
+      `SELECT COUNT(*) AS files,
+              COALESCE(SUM(blocks), 0) AS blocks,
+              COALESCE(SUM(chars), 0) AS chars,
+              MAX(created_at) AS last_at
+       FROM kb_documents`
+    );
+    const r = rows[0] || {};
+    return sendJSON(res, 200, {
+      code: 0,
+      data: {
+        files: Number(r.files) || 0,
+        blocks: Number(r.blocks) || 0,
+        chars: Number(r.chars) || 0,
+        lastUploadAt: r.last_at || null,
+        vectors: knowledgeBase.count(),        // 向量库实际条数，可与 blocks 对不上时用来排查
+        collection: knowledgeBase.KB_COLLECTION,
+        topK: knowledgeBase.DEFAULT_TOP_K,
+        minScore: knowledgeBase.DEFAULT_MIN_SCORE,
+      },
+    });
+  } catch (e) {
+    console.error('admin kb stats error:', e.message);
+    return sendJSON(res, 500, { code: 500, admin: true, message: '读取知识库概览失败' });
+  }
+}
+
+// ==================== 管理者：已上传文件列表（分页） ====================
+async function handleAdminKbDocuments(req, res, url) {
+  if (!pool) return dbNotReady(res);
+  try {
+    const qs = url && url.searchParams ? url.searchParams : new URLSearchParams();
+    let page = Math.max(1, parseInt(qs.get('page'), 10) || 1);
+    const pageSize = Math.min(50, Math.max(1, parseInt(qs.get('pageSize'), 10) || 20));
+
+    const [countRows] = await pool.query('SELECT COUNT(*) AS c FROM kb_documents');
+    const total = Number(countRows[0].c) || 0;
+    const totalPages = Math.max(1, Math.ceil(total / pageSize));
+    page = Math.min(page, totalPages);
+
+    const [rows] = await pool.query(
+      `SELECT id, filename, md5, blocks, chunks, chars, encoding, operator_name, created_at
+       FROM kb_documents
+       ORDER BY created_at DESC, id DESC
+       LIMIT ? OFFSET ?`,
+      [pageSize, (page - 1) * pageSize]
+    );
+
+    return sendJSON(res, 200, {
+      code: 0,
+      data: {
+        list: rows.map((r) => ({
+          id: r.id,
+          filename: r.filename,
+          blocks: r.blocks,
+          chunks: r.chunks,
+          chars: r.chars,
+          encoding: r.encoding || '',
+          operator: r.operator_name,
+          createdAt: r.created_at,
+        })),
+        total,
+        page,
+        pageSize,
+        totalPages,
+      },
+    });
+  } catch (e) {
+    console.error('admin kb documents error:', e.message);
+    return sendJSON(res, 500, { code: 500, admin: true, message: '读取文件列表失败' });
+  }
+}
+
+/**
+ * 单个文件的入库流程（幂等）。步骤与参考项目一致，但两处按本项目约定调整：
+ *   ① 去重记录进 MySQL（kb_documents.md5 唯一键）而不是 md5.text 文件
+ *   ② 先写向量、再写台账；台账唯一键冲突（并发重复上传）时回滚刚写入的向量，
+ *      保证「向量库里有、台账里没有」的孤儿数据不会出现
+ *
+ * @returns {{filename, status:'ok'|'skipped'|'rejected', message?, blocks?, chunks?, chars?, encoding?}}
+ */
+async function ingestKnowledgeFile({ filename, buffer, user }) {
+  const safeName = sanitizeFilename(filename);
+
+  if (!/\.txt$/i.test(safeName)) {
+    return { filename: safeName, status: 'rejected', message: '仅支持 .txt 文件' };
+  }
+  if (buffer.length > KB_MAX_FILE_BYTES) {
+    return {
+      filename: safeName,
+      status: 'rejected',
+      message: `文件超过 ${Math.round(KB_MAX_FILE_BYTES / 1024 / 1024)}MB 上限`,
+    };
+  }
+
+  const decoded = decodeTextBuffer(buffer);
+  const text = knowledgeBase.normalizeText(decoded.text);
+  if (!text) {
+    return { filename: safeName, status: 'rejected', message: '文件内容为空', encoding: decoded.encoding };
+  }
+  if (text.length > KB_MAX_FILE_CHARS) {
+    return {
+      filename: safeName,
+      status: 'rejected',
+      message: `解析后文本超过 ${Math.round(KB_MAX_FILE_CHARS / 10000)} 万字上限，请拆分后上传`,
+      encoding: decoded.encoding,
+    };
+  }
+
+  const fp = knowledgeBase.fingerprint(text);
+  const [dupRows] = await pool.query(
+    'SELECT filename FROM kb_documents WHERE md5 = ? LIMIT 1',
+    [fp]
+  );
+  if (dupRows.length) {
+    return {
+      filename: safeName,
+      status: 'skipped',
+      message: `内容与「${dupRows[0].filename}」重复，已跳过`,
+      encoding: decoded.encoding,
+    };
+  }
+
+  const blocks = knowledgeBase.parseKnowledgeFile(text, safeName);
+  if (!blocks.length) {
+    return { filename: safeName, status: 'rejected', message: '未解析出可入库的内容', encoding: decoded.encoding };
+  }
+
+  const docId = crypto.randomUUID();
+  const { chunks } = knowledgeBase.ingestBlocks({
+    docId,
+    filename: safeName,
+    blocks,
+    operator: user && user.username ? user.username : '',
+  });
+
+  try {
+    await pool.query(
+      `INSERT INTO kb_documents
+        (id, filename, md5, blocks, chunks, chars, encoding, operator_id, operator_name)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        docId, safeName, fp, blocks.length, chunks, text.length, decoded.encoding,
+        (user && user.uid) || '', (user && user.username) || '',
+      ]
+    );
+  } catch (e) {
+    // 并发重复上传会撞唯一键：把刚写入的向量撤掉，保持与台账一致
+    knowledgeBase.deleteByDocument(docId);
+    if (e && e.code === 'ER_DUP_ENTRY') {
+      return { filename: safeName, status: 'skipped', message: '内容已存在（并发重复上传），已跳过', encoding: decoded.encoding };
+    }
+    throw e;
+  }
+
+  return {
+    filename: safeName,
+    status: 'ok',
+    blocks: blocks.length,
+    chunks,
+    chars: text.length,
+    encoding: decoded.encoding,
+    message: `已入库 ${blocks.length} 个知识单元`,
+  };
+}
+
+// ==================== 管理者：批量上传 txt 入知识库 ====================
+async function handleAdminKbUpload(req, res) {
+  if (!pool) return dbNotReady(res);
+
+  const contentType = req.headers['content-type'] || '';
+  const boundary = parseBoundary(contentType);
+  if (!contentType.includes('multipart/form-data') || !boundary) {
+    return sendJSON(res, 400, { code: 400, admin: true, message: '请以 multipart/form-data 上传文件' });
+  }
+
+  let buf;
+  try {
+    buf = await readBody(req, MAX_KB_BODY);
+  } catch (e) {
+    return sendJSON(res, 413, {
+      code: 413,
+      admin: true,
+      message: `单次上传内容超过 ${Math.round(MAX_KB_BODY / 1024 / 1024)}MB，请分批上传`,
+    });
+  }
+
+  const files = parseMultipart(buf, boundary).filter((p) => p.filename);
+  if (!files.length) {
+    return sendJSON(res, 400, { code: 400, admin: true, message: '未检测到文件内容' });
+  }
+  if (files.length > KB_MAX_FILES) {
+    return sendJSON(res, 400, {
+      code: 400,
+      admin: true,
+      message: `单次最多上传 ${KB_MAX_FILES} 个文件，当前 ${files.length} 个，请分批上传`,
+    });
+  }
+
+  const results = [];
+  for (const f of files) {
+    try {
+      results.push(await ingestKnowledgeFile({ filename: f.filename, buffer: f.body, user: req.authUser }));
+    } catch (e) {
+      console.error('kb ingest error:', e.message);
+      results.push({
+        filename: sanitizeFilename(f.filename),
+        status: 'rejected',
+        message: '入库失败：' + e.message,
+      });
+    }
+  }
+
+  const okCount = results.filter((r) => r.status === 'ok').length;
+  const skipCount = results.filter((r) => r.status === 'skipped').length;
+  const failCount = results.filter((r) => r.status === 'rejected').length;
+  console.log(`[admin] 知识库上传 user=${req.authUser.username} 成功=${okCount} 跳过=${skipCount} 失败=${failCount}`);
+
+  return sendJSON(res, 200, {
+    code: 0,
+    message: `成功 ${okCount} 个，跳过 ${skipCount} 个，失败 ${failCount} 个`,
+    data: { results, summary: { ok: okCount, skipped: skipCount, failed: failCount }, vectors: knowledgeBase.count() },
+  });
+}
+
+// ==================== 管理者：检索测试（用于校准 top-k 与门槛） ====================
+// 刻意不套门槛，把原始分数与「是否过门槛」一并返回，
+// 让管理员能按自己语料的真实分数分布来决定门槛该调高还是调低。
+async function handleAdminKbSearch(req, res) {
+  const payload = safeJSON(bodyToText(await readBody(req)));
+  if (payload === null) return sendJSON(res, 400, { code: 400, admin: true, message: '请求格式错误' });
+
+  const question = String(payload.question || '').trim();
+  if (!question) return sendJSON(res, 400, { code: 400, admin: true, message: '请输入测试问题' });
+  if (question.length > 500) {
+    return sendJSON(res, 400, { code: 400, admin: true, message: '测试问题不超过 500 字' });
+  }
+
+  const n = Math.min(20, Math.max(1, Number(payload.n) || knowledgeBase.DEFAULT_TOP_K));
+  const minScore = typeof payload.minScore === 'number' && payload.minScore >= 0 && payload.minScore <= 1
+    ? payload.minScore
+    : knowledgeBase.DEFAULT_MIN_SCORE;
+
+  try {
+    const raw = chroma.query(knowledgeBase.KB_COLLECTION, { queryText: question, n });
+    return sendJSON(res, 200, {
+      code: 0,
+      data: {
+        question,
+        n,
+        minScore,
+        hits: raw.map((h) => ({
+          score: Math.round(h.score * 1000) / 1000,
+          pass: h.score > minScore,
+          title: (h.meta && h.meta.title) || '',
+          filename: (h.meta && h.meta.filename) || '',
+          kind: (h.meta && h.meta.kind) || 'note',
+          text: h.text,
+        })),
+      },
+    });
+  } catch (e) {
+    console.error('admin kb search error:', e.message);
+    return sendJSON(res, 500, { code: 500, admin: true, message: '检索失败' });
+  }
+}
+
+// ==================== 管理者：删除某个文件的知识（连带向量） ====================
+// 顺序：先删向量，再删台账。反过来的话，一旦向量删除失败就会留下
+// 「台账里看不见、检索却仍会命中」的脏数据。
+async function handleAdminKbDeleteDocument(req, res, id) {
+  if (!pool) return dbNotReady(res);
+  try {
+    const [rows] = await pool.query('SELECT id, filename FROM kb_documents WHERE id = ?', [id]);
+    if (!rows.length) return sendJSON(res, 404, { code: 404, admin: true, message: '未找到该文件记录' });
+
+    const removed = knowledgeBase.deleteByDocument(id);
+    await pool.query('DELETE FROM kb_documents WHERE id = ?', [id]);
+    console.log(`[admin] 删除知识库文件 ${rows[0].filename} 向量 ${removed} 条 user=${req.authUser.username}`);
+    return sendJSON(res, 200, {
+      code: 0,
+      message: `已删除「${rows[0].filename}」及其 ${removed} 条向量`,
+      data: { removed, vectors: knowledgeBase.count() },
+    });
+  } catch (e) {
+    console.error('admin kb delete error:', e.message);
+    return sendJSON(res, 500, { code: 500, admin: true, message: '删除失败' });
+  }
+}
+
+// ==================== 管理者：清空知识库 ====================
+// 破坏性操作：要求请求体显式带上 confirm 文本，防止误触/CSRF 式的一键清空。
+async function handleAdminKbReset(req, res) {
+  if (!pool) return dbNotReady(res);
+  const payload = safeJSON(bodyToText(await readBody(req)));
+  if (payload === null) return sendJSON(res, 400, { code: 400, admin: true, message: '请求格式错误' });
+  if (payload.confirm !== '清空知识库') {
+    return sendJSON(res, 400, { code: 400, admin: true, message: '请在确认框中输入「清空知识库」以执行' });
+  }
+  try {
+    // 恒真条件 = 清空整个 collection（向量库按 collection 隔离，不会波及题库向量 haigui_soups）
+    const removed = chroma.deleteWhere(knowledgeBase.KB_COLLECTION, () => true);
+    await pool.query('DELETE FROM kb_documents');
+    console.warn(`[admin] 清空知识库，删除向量 ${removed} 条 user=${req.authUser.username}`);
+    return sendJSON(res, 200, { code: 0, message: `已清空知识库（${removed} 条向量）`, data: { removed } });
+  } catch (e) {
+    console.error('admin kb reset error:', e.message);
+    return sendJSON(res, 500, { code: 500, admin: true, message: '清空失败' });
   }
 }
 
